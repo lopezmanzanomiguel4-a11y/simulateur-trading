@@ -1,0 +1,16 @@
+# Environnement Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Bases de données et secrets
+*.db
+*.db-journal
+*.sqlite3
+.env
+
+# Éditeurs / système
+.vscode/
+.idea/
+Thumbs.db
