@@ -150,7 +150,7 @@ La limite est atteinte si $\text{PnL}_s \le -\,p \cdot E_0$. Un **arrêt de sess
 
 Les limites sont **propres à chaque compte** (défauts ci-dessus tant qu'elles ne sont pas modifiées) et recopiées au reset.
 
-**Stop de protection** : chaque entrée d'un compte automatique pose (ou remplace) **le** stop de la paire, sur toute la position, avec un objectif lié facultatif. Pour un achat au marché (`entrer`, `POST /ordres/entree`), l'achat et le stop sont faits dans une seule transaction : si le stop ou l'objectif est invalide, rien n'est acheté. Pour un achat limite, le stop est posé à l'exécution. Si le bid est déjà sous le stop au déclenchement, l'achat est rejeté (`stop_deja_touche`). Sur un compte automatique, ce stop :
+**Stop de protection** : chaque entrée d'un compte automatique pose (ou remplace) **le** stop de la paire, sur toute la position, avec un objectif lié facultatif. Le stop ne baisse jamais : après une nouvelle entrée, le stop actif est le plus haut des deux (ancien et nouveau), et un objectif qui serait sous ce stop est ignoré. Un stop au niveau ou au-dessus du bid à l'entrée est refusé et journalisé (`stop_obligatoire`). Pour un achat au marché (`entrer`, `POST /ordres/entree`), l'achat et le stop sont faits dans une seule transaction : si le stop ou l'objectif est invalide, rien n'est acheté. Pour un achat limite, le stop est posé à l'exécution. Si le bid est déjà sous le stop au déclenchement, l'achat est rejeté (`stop_deja_touche`). Sur un compte automatique, ce stop :
 - ne peut pas être **annulé** tant que la position est ouverte (son objectif, si) ;
 - ne se **déplace que vers le haut**, toujours sous le bid ;
 - ne **réserve pas** la quantité : une vente au marché ou limite reste toujours possible, et le stop couvre ce qui reste ;
@@ -310,9 +310,7 @@ L'API ne fait qu'appeler `TradingService`, qui reçoit un `CachedFeed` à la pla
 - **Pas d'intervention manuelle sur un compte automatique** autre que par les mêmes routes, qui le traitent comme automatique (règles de session et garde-fou compris).
 - **Le garde-fou ne protège que les comptes automatiques.** Un compte manuel peut tout faire, par construction.
 - **Perte de session estimée au bid, hors frais de sortie** : la perte réelle à la vente serait un peu plus forte (0,1 % de frais).
-- **Arrêt de session détecté au mieux chaque seconde** (ou à la tentative d'entrée) : un passage très bref sous la limite, entre deux vérifications et sans tentative d'entrée, peut ne pas être enregistré.
-- **Un stop de protection par paire** : une nouvelle entrée le remplace, y compris par un stop plus bas. Seul son déplacement ultérieur est limité vers le haut.
-- **CLI : une connexion websocket par commande** : chaque commande met 1 à 4 s à obtenir un prix (le temps d'établir la connexion). L'API n'a pas ce délai.
+- **Arrêt de session détecté au mieux chaque seconde** (ou à la tentative d'entrée) : un passage très bref sous la limite, entre deux vérifications et sans tentative d'entrée, peut ne pas être enregistré.- **CLI : une connexion websocket par commande** : chaque commande met 1 à 4 s à obtenir un prix (le temps d'établir la connexion). L'API n'a pas ce délai.
 - **Coinbase en secours est moins liquide en USDT** : le spread BTC-USDT y est nettement plus large que sur Binance (constaté : environ 3,5 pb contre moins de 0,01 pb), et le canal ticker ne se met à jour qu'à chaque transaction.
 - CLI : pas de reconnexion automatique si le flux continu `prix` est coupé en cours de route (l'API, elle, se reconnecte).
 - **Bougies en mémoire seulement** : rechargées depuis Binance à chaque démarrage (1 journée en 1m, 500 bougies au-delà), rien n'est sauvegardé localement.

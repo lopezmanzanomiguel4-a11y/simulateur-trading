@@ -181,13 +181,14 @@ class TradingService:
                 portfolio = self._open_portfolio(account.id)
                 amount = portfolio.check_buy(amount_usdt)
                 if account.mode == AUTO:
-                    self._guard(account, EntryRequest(pair, amount, quote.ask, stop, MARKET_ENTRY, now), quotes)
+                    request = EntryRequest(pair, amount, quote.ask, stop, MARKET_ENTRY, now, bid=quote.bid)
+                    self._guard(account, request, quotes)
                 if stop is not None:
                     self._check_protection(pair, stop, target, quote)
                 order = portfolio.buy(quote, amount, now)
                 saved = self.storage.save_trade(portfolio, order)
                 if stop is not None:
-                    self._set_protection(account.id, pair, stop, target, now)
+                    self._set_protection(account, pair, stop, target, now)
         except RiskRefused as exc:
             self._log_refusal(exc.record)
             raise
@@ -370,10 +371,18 @@ class TradingService:
             rules_orders.check_new(TARGET, Side.SELL, pair, target, quote)
 
     def _set_protection(
-        self, account_id: int, pair: str, stop: Decimal, target: Decimal | None, now: datetime
+        self, account: Account, pair: str, stop: Decimal, target: Decimal | None, now: datetime
     ) -> list[PendingOrder]:
-        """Pose (ou remplace) LE stop de protection de la paire, avec son objectif éventuel."""
-        for old in self.storage.protection_orders(account_id, pair):
+        """Pose (ou remplace) LE stop de protection de la paire, avec son objectif éventuel.
+
+        Compte auto : le stop ne baisse jamais, une nouvelle entrée garde max(ancien stop, nouveau stop)."""
+        account_id = account.id
+        old_orders = self.storage.protection_orders(account_id, pair)
+        if account.mode == AUTO:
+            stop = max([stop] + [o.trigger_price for o in old_orders if o.kind == STOP])
+            if target is not None and target <= stop:
+                target = None  # objectif sous le stop conservé : il n'aurait plus de sens
+        for old in old_orders:
             self.storage.close_pending(old.id, CANCELLED, "remplace", now)
         legs = [PendingOrder(account_id, pair, STOP, Side.SELL, stop, None, None, now, protection=True)]
         if target is not None:
@@ -683,7 +692,7 @@ class TradingService:
         for o in others:
             self.storage.close_pending(o.id, CANCELLED, "oco", now)
         if pending.side is Side.BUY and pending.stop_price is not None:
-            self._set_protection(account.id, pending.pair, pending.stop_price, pending.target_price, now)
+            self._set_protection(account, pending.pair, pending.stop_price, pending.target_price, now)
         if pending.side is Side.SELL:
             self._after_exit(account.id, portfolio, pending.pair, now)
         log.info("Ordre en attente n°%s exécuté : %s %s %s à %s.", pending.id, pending.kind, order.quantity, order.pair, order.price)

@@ -152,6 +152,28 @@ def test_nouvelle_entree_remplace_le_stop(env):
     assert (replaced.status, replaced.reason) == (CANCELLED, "remplace")
 
 
+def test_nouvelle_entree_avec_stop_plus_bas_ne_baisse_pas_le_stop(env):
+    enter(env, amount="500", stop="95")
+    later(env, 15)
+    env.quote("100")
+    enter(env, amount="500", stop="90", target="110")  # stop plus bas que l'actuel
+    stop, target = protection(env)
+    assert stop.trigger_price == D("95")  # le stop actif reste >= 95
+    assert target.trigger_price == D("110")
+    env.quote("94.9")
+    sell = robot_orders(env)[-1]
+    assert (sell.kind, sell.quantity) == (STOP, robot_orders(env)[0].quantity + robot_orders(env)[1].quantity)
+
+
+def test_stop_entre_bid_et_ask_refuse_et_journalise(env):
+    env.quote("100", "100.5")
+    with pytest.raises(RiskRefused, match="doit être sous le bid"):
+        enter(env, stop="100.2")
+    (record,) = env.service.refusals(compte="robot")
+    assert record.rules == ("stop_obligatoire",) and record.stop_price == D("100.2")
+    assert robot_orders(env) == []
+
+
 def test_annulation_du_dernier_stop_refusee_objectif_seul_accepte(env):
     enter(env, target="110")
     stop, target = protection(env)

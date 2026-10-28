@@ -65,6 +65,7 @@ class EntryRequest:
     stop: Decimal | None
     moment: str
     now: datetime
+    bid: Decimal | None = None  # entrée au marché : le stop doit aussi être sous le bid (sinon il partirait aussitôt)
 
 
 @dataclass(frozen=True)
@@ -99,6 +100,14 @@ def check_entry(request: EntryRequest, state: RiskState, limits: RiskLimits) -> 
             Refusal(
                 STOP_REQUIRED,
                 f"le stop ({fmt.price(request.stop)}) doit être sous le prix d'entrée ({fmt.price(request.price)})",
+            )
+        )
+    elif request.bid is not None and request.stop >= request.bid:
+        refusals.append(
+            Refusal(
+                STOP_REQUIRED,
+                f"le stop ({fmt.price(request.stop)}) doit être sous le bid ({fmt.price(request.bid)}), "
+                "sinon il partirait aussitôt",
             )
         )
     if state.stale:

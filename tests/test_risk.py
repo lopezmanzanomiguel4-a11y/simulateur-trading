@@ -59,6 +59,13 @@ def test_stop_au_dessus_du_prix_d_entree_refuse():
     assert rules(entry(stop="99.99"), state()) == []
 
 
+def test_stop_au_dessus_du_bid_refuse():
+    request = EntryRequest("BTCUSDT", D("1000"), D("100.5"), D("100.2"), MARKET_ENTRY, NOW, bid=D("100"))
+    assert rules(request, state()) == [STOP_REQUIRED]
+    request = EntryRequest("BTCUSDT", D("1000"), D("100.5"), D("99.99"), MARKET_ENTRY, NOW, bid=D("100"))
+    assert rules(request, state()) == []
+
+
 def test_taille_max_a_la_limite_exacte():
     assert rules(entry(amount="2000"), state()) == []
     assert rules(entry(amount="2000.01"), state()) == [MAX_SIZE]
