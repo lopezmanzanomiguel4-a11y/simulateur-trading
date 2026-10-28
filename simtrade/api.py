@@ -68,7 +68,8 @@ def iso(dt: datetime) -> str:
     return dt.isoformat()
 
 
-def quote_json(quote: Quote, age: float) -> dict:
+def quote_json(quote: Quote, feed: CachedFeed) -> dict:
+    age = feed.age(quote)
     return {
         "paire": quote.pair,
         "bid": dec(quote.bid),
@@ -77,6 +78,7 @@ def quote_json(quote: Quote, age: float) -> dict:
         "source": quote.source,
         "received_at": iso(quote.received_at),
         "age_secondes": round(age, 3),
+        "perime": age > feed.max_age,
     }
 
 
@@ -142,8 +144,13 @@ def create_app(service: ServiceFactory | None = None, hub: PriceHub | None = Non
 
     @app.exception_handler(RequestValidationError)
     async def validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
-        fields = [str(e["loc"][-1]) for e in exc.errors() if e.get("loc")]
-        if fields and fields[0] != "body":
+        # loc = ("body", "<champ>") pour un champ ; ("body", <position>) pour un JSON illisible.
+        fields = [
+            e["loc"][1]
+            for e in exc.errors()
+            if e["type"] != "json_invalid" and len(e.get("loc", ())) >= 2 and isinstance(e["loc"][1], str)
+        ]
+        if fields:
             message = f"Champ '{fields[0]}' manquant ou invalide (chaîne attendue)."
         else:
             message = "Corps de requête JSON invalide."
@@ -154,9 +161,12 @@ def create_app(service: ServiceFactory | None = None, hub: PriceHub | None = Non
 
     @app.get("/prix")
     async def prix(request: Request) -> dict:
+        # Lecture directe du cache : les cotations périmées sont renvoyées, marquées "perime".
         feed: CachedFeed = request.app.state.feed
-        quotes = await svc_of(request).prices()
-        return {"cotations": [quote_json(q, feed.age(q)) for q in quotes.values()]}
+        quotes = [feed.hub.quotes[p] for p in feed.hub.pairs if p in feed.hub.quotes]
+        if not quotes:
+            raise FeedUnavailable("Aucune cotation reçue pour l'instant (flux en connexion).")
+        return {"cotations": [quote_json(q, feed) for q in quotes]}
 
     @app.post("/ordres/achat")
     async def achat(body: BuyBody, request: Request) -> dict:
@@ -232,7 +242,7 @@ def create_app(service: ServiceFactory | None = None, hub: PriceHub | None = Non
                 try:
                     async with aclosing(websocket.app.state.service.stream_prices()) as stream:
                         async for quote in stream:
-                            await websocket.send_json(quote_json(quote, feed.age(quote)))
+                            await websocket.send_json(quote_json(quote, feed))
                 except (WebSocketDisconnect, OSError):  # OSError : client parti pendant l'envoi
                     pass
                 tg.cancel_scope.cancel()

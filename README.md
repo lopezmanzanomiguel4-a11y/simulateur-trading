@@ -76,11 +76,11 @@ $env:SIMTRADE_DB = "C:\chemin\vers\autre.db"
 python -m simtrade api
 ```
 
-Lance un serveur local sur `http://127.0.0.1:8000` (pas accessible depuis le réseau). Il garde **une seule** connexion websocket de prix ouverte (Binance, sinon Coinbase) et met les cotations en cache : les ordres sont exécutés instantanément au dernier prix reçu. Si le flux tombe, il se reconnecte tout seul (attente de 1, 2, 4… jusqu'à 30 s). Une cotation de plus de 5 s est refusée (erreur 503) plutôt qu'utilisée. Documentation interactive : `http://127.0.0.1:8000/docs`.
+Lance un serveur local sur `http://127.0.0.1:8000` (pas accessible depuis le réseau). Il garde **une seule** connexion websocket de prix ouverte (Binance, sinon Coinbase) et met les cotations en cache : les ordres sont exécutés instantanément au dernier prix reçu. Si le flux tombe, il se reconnecte tout seul (attente de 1, 2, 4… jusqu'à 30 s). Un ordre n'est jamais exécuté sur une cotation de plus de 5 s (erreur 503) ; `/prix` renvoie quand même tout le cache, avec `"perime": true` pour ces cotations (503 seulement si aucune cotation n'a encore été reçue). Documentation interactive : `http://127.0.0.1:8000/docs`.
 
 | Méthode | Route | Corps JSON | Réponse |
 |---|---|---|---|
-| GET | `/prix` | | bid, ask, spread, source, heure et âge de chaque cotation |
+| GET | `/prix` | | bid, ask, spread, source, heure, âge et `perime` de chaque cotation |
 | POST | `/ordres/achat` | `{"paire": "btc", "montant": "500"}` | ordre exécuté + solde |
 | POST | `/ordres/vente` | `{"paire": "eth", "quantite": "0.05"}` ou `"tout"` | ordre exécuté + solde |
 | GET | `/portefeuille` | | positions, valeur, P&L, frais, performance |

@@ -66,6 +66,7 @@ def test_prix(client):
     assert (btc["bid"], btc["ask"], btc["spread"], btc["source"]) == ("80000", "80001", "1", "Simulé")
     assert cotations["SOLUSDT"]["spread"] == "0.02"
     assert 0 <= btc["age_secondes"] < 5 and btc["received_at"]
+    assert not any(c["perime"] for c in cotations.values())
 
 
 def test_ws_prix_envoie_les_cotations_du_cache(client):
@@ -182,18 +183,41 @@ def test_nombre_json_refuse_400(client):
     assert r.status_code == 400 and "quantite" in r.json()["erreur"]
 
 
+def test_corps_non_json_400(client):
+    for body in ("pas du json", '{"paire": "btc", '):
+        r = client.post("/ordres/achat", content=body, headers={"Content-Type": "application/json"})
+        assert r.status_code == 400
+        assert r.json() == {"erreur": "Corps de requête JSON invalide."}
+
+
 def test_cotation_perimee_503(tmp_path):
     hub = PriceHub(SilentFeed())
     old = Quote("BTCUSDT", D("80000"), D("80001"), "Simulé", utcnow() - timedelta(seconds=10))
     hub.update(old)
     with make_client(tmp_path, hub) as c:
-        r = c.get("/prix")
-        assert r.status_code == 503 and r.json()["erreur"].startswith("Cotation périmée pour BTCUSDT")
         r = buy(c, "btc", "100")
         assert r.status_code == 503 and "périmée" in r.json()["erreur"]
         r = buy(c, "eth", "100")
         assert r.status_code == 503 and r.json()["erreur"] == "Pas encore de prix pour ETHUSDT (flux en connexion)."
         assert c.get("/info").json()["flux"]["connecte"] is False
+
+
+def test_prix_renvoie_aussi_les_cotations_perimees(tmp_path):
+    hub = PriceHub(SilentFeed())
+    hub.update(Quote("BTCUSDT", D("80000"), D("80001"), "Simulé", utcnow() - timedelta(seconds=10)))
+    hub.update(Quote("ETHUSDT", D("2350"), D("2350.5"), "Simulé", utcnow()))
+    with make_client(tmp_path, hub) as c:
+        r = c.get("/prix")
+    assert r.status_code == 200
+    perime = {q["paire"]: q["perime"] for q in r.json()["cotations"]}
+    assert perime == {"BTCUSDT": True, "ETHUSDT": False}
+
+
+def test_prix_cache_vide_503(tmp_path):
+    with make_client(tmp_path, PriceHub(SilentFeed())) as c:
+        r = c.get("/prix")
+    assert r.status_code == 503
+    assert r.json() == {"erreur": "Aucune cotation reçue pour l'instant (flux en connexion)."}
 
 
 # --- CachedFeed et PriceHub, sans HTTP ---
