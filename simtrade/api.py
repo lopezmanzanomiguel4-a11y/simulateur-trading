@@ -13,6 +13,7 @@ from contextlib import aclosing, asynccontextmanager
 from datetime import datetime
 from decimal import Decimal
 
+import anyio
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -223,26 +224,26 @@ def create_app(service: ServiceFactory | None = None, hub: PriceHub | None = Non
         await websocket.accept()
         feed: CachedFeed = websocket.app.state.feed
 
-        async def send_quotes() -> None:
-            async with aclosing(websocket.app.state.service.stream_prices()) as stream:
-                async for quote in stream:
-                    await websocket.send_json(quote_json(quote, feed.age(quote)))
+        # Un envoi vers un client parti ne lève pas toujours d'erreur : une tâche écoute la
+        # fermeture, et la première des deux qui se termine arrête l'autre.
+        async with anyio.create_task_group() as tg:
 
-        async def wait_disconnect() -> None:
-            # Un envoi vers un client parti ne lève pas toujours d'erreur : on écoute la fermeture.
-            while (await websocket.receive())["type"] != "websocket.disconnect":
-                pass
+            async def send_quotes() -> None:
+                try:
+                    async with aclosing(websocket.app.state.service.stream_prices()) as stream:
+                        async for quote in stream:
+                            await websocket.send_json(quote_json(quote, feed.age(quote)))
+                except (WebSocketDisconnect, OSError):  # OSError : client parti pendant l'envoi
+                    pass
+                tg.cancel_scope.cancel()
 
-        tasks = [asyncio.create_task(send_quotes()), asyncio.create_task(wait_disconnect())]
-        try:
-            await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-        finally:
-            for task in tasks:
-                task.cancel()
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-        for result in results:
-            if isinstance(result, Exception) and not isinstance(result, WebSocketDisconnect):
-                raise result
+            async def wait_disconnect() -> None:
+                while (await websocket.receive())["type"] != "websocket.disconnect":
+                    pass
+                tg.cancel_scope.cancel()
+
+            tg.start_soon(send_quotes)
+            tg.start_soon(wait_disconnect)
 
     return app
 
