@@ -20,11 +20,12 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from simtrade.config import db_path
-from simtrade.engine import DEFAULT_CAPITAL
+from simtrade import market
+from simtrade.engine import DEFAULT_CAPITAL, normalize_pair
 from simtrade.errors import FeedUnavailable, InvalidCapital, InvalidInput, OrderRejected, SimTradeError
 from simtrade.feeds.base import PriceFeed
 from simtrade.hub import CachedFeed, PriceHub
-from simtrade.models import Account, Order, Quote
+from simtrade.models import Account, Order, Quote, utcnow
 from simtrade.service import TradeResult, TradingService
 from simtrade.storage import Storage
 
@@ -109,6 +110,43 @@ def order_json(order: Order) -> dict:
 
 def trade_json(result: TradeResult) -> dict:
     return {"ordre": order_json(result.order), "solde": dec(result.cash)}
+
+
+def candle_json(candle: market.Candle, now: datetime) -> dict:
+    return {
+        "ouverture_le": iso(candle.open_time),
+        "ouverture": dec(candle.open),
+        "haut": dec(candle.high),
+        "bas": dec(candle.low),
+        "cloture": dec(candle.close),
+        "volume": dec(candle.volume),
+        "notional": dec(candle.notional),
+        "cotations": candle.ticks,
+        "cloturee": candle.is_closed(now),
+    }
+
+
+def opt(value: Decimal | None) -> str | None:
+    return None if value is None else dec(value)
+
+
+# --- Paramètres de requête (lus en chaîne pour garder nos propres messages d'erreur) ---
+
+
+def interval_param(raw: str) -> str:
+    if raw not in market.INTERVALS:
+        raise InvalidInput(f"Intervalle inconnu : '{raw}'. Intervalles disponibles : {', '.join(market.INTERVALS)}.")
+    return raw
+
+
+def int_param(raw: str, label: str, low: int = 1, high: int = market.MAX_CANDLES) -> int:
+    try:
+        value = int(raw)
+    except ValueError:
+        raise InvalidInput(f"Paramètre '{label}' invalide : '{raw}' n'est pas un entier.") from None
+    if not low <= value <= high:
+        raise InvalidInput(f"Paramètre '{label}' hors bornes : entre {low} et {high} (reçu : {raw}).")
+    return value
 
 
 # --- Application ---
@@ -227,6 +265,52 @@ def create_app(service: ServiceFactory | None = None, hub: PriceHub | None = Non
                 "derniere_erreur": h.last_error,
                 "reconnexions": h.reconnects,
             },
+            "flux_volume": {
+                "actif": h.feed.has_trades,
+                "connecte": h.trade_status.connected,
+                "derniere_transaction": iso(h.last_trade_at) if h.last_trade_at else None,
+                "derniere_erreur": h.trade_status.last_error,
+                "reconnexions": h.trade_status.reconnects,
+            },
+        }
+
+    def market_of(request: Request) -> market.MarketData:
+        return request.app.state.hub.market
+
+    @app.get("/bougies/{paire}")
+    async def bougies(paire: str, request: Request, intervalle: str = "1m", limite: str = "100") -> dict:
+        pair, interval = normalize_pair(paire), interval_param(intervalle)
+        candles = market_of(request).candles(pair, interval, int_param(limite, "limite"))
+        now = utcnow()
+        return {"paire": pair, "intervalle": interval, "bougies": [candle_json(c, now) for c in candles]}
+
+    @app.get("/indicateurs/{paire}")
+    async def indicateurs(
+        paire: str,
+        request: Request,
+        intervalle: str = "1m",
+        fenetre: str = str(market.MAX_CANDLES),
+        sma: str = "20",
+        ema: str = "20",
+        rsi: str = "14",
+    ) -> dict:
+        pair, interval = normalize_pair(paire), interval_param(intervalle)
+        n_sma, n_ema = int_param(sma, "sma"), int_param(ema, "ema")
+        n_rsi = int_param(rsi, "rsi", high=market.MAX_CANDLES - 1)
+        candles = market_of(request).candles(pair, interval, int_param(fenetre, "fenetre"))
+        closes = [c.close for c in candles]
+        return {
+            "paire": pair,
+            "intervalle": interval,
+            "nb_bougies": len(candles),
+            "debut": iso(candles[0].open_time) if candles else None,
+            "dernier_prix": opt(closes[-1]) if closes else None,
+            "sma": {"periode": n_sma, "valeur": opt(market.sma(closes, n_sma))},
+            "ema": {"periode": n_ema, "valeur": opt(market.ema(closes, n_ema))},
+            "rsi": {"periode": n_rsi, "valeur": opt(market.rsi(closes, n_rsi))},
+            "vwap": opt(market.vwap(candles)),
+            "variation_pct": opt(market.variation_pct(candles)),
+            "volume": dec(sum((c.volume for c in candles), Decimal(0))),
         }
 
     @app.websocket("/ws/prix")

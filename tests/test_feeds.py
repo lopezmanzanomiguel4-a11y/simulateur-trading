@@ -89,3 +89,77 @@ def test_toutes_les_sources_en_panne():
 def test_snapshot_incomplet():
     with pytest.raises(FeedUnavailable, match="ETHUSDT"):
         asyncio.run(StaticFeed({"BTCUSDT": ("1", "2")}).snapshot(["BTCUSDT", "ETHUSDT"]))
+
+
+# --- Transactions (volume) ---
+
+
+def test_parse_binance_agg_trade():
+    raw = json.dumps(
+        {
+            "stream": "btcusdt@aggTrade",
+            "data": {"e": "aggTrade", "s": "BTCUSDT", "a": 1, "p": "80660.01000000", "q": "0.00125000", "m": False},
+        }
+    )
+    t = binance.parse_trade(raw)
+    assert (t.pair, t.price, t.quantity, t.source) == ("BTCUSDT", D("80660.01"), D("0.00125"), "Binance")
+    assert binance.parse_message(raw) is None  # pas une cotation
+
+
+def test_parse_binance_trade_ignore_book_ticker():
+    raw = json.dumps({"data": {"s": "BTCUSDT", "b": "1", "a": "2"}})
+    assert binance.parse_trade(raw) is None
+
+
+def test_parse_coinbase_match():
+    products = {"ETH-USDT": "ETHUSDT"}
+    raw = json.dumps({"type": "match", "product_id": "ETH-USDT", "price": "2350.10", "size": "0.5000", "side": "buy"})
+    t = coinbase.parse_match(raw, products)
+    assert (t.pair, t.price, t.quantity, t.source) == ("ETHUSDT", D("2350.1"), D("0.5"), "Coinbase")
+
+
+def test_parse_coinbase_last_match_ignore():
+    raw = json.dumps({"type": "last_match", "product_id": "ETH-USDT", "price": "2350", "size": "1"})
+    assert coinbase.parse_match(raw, {"ETH-USDT": "ETHUSDT"}) is None
+
+
+def test_parse_coinbase_match_erreur():
+    with pytest.raises(FeedUnavailable, match="invalid product"):
+        coinbase.parse_match(json.dumps({"type": "error", "message": "x", "reason": "invalid product"}), {})
+
+
+class BrokenTradesFeed(BrokenFeed):
+    has_trades = True
+
+    async def trades(self, pairs):
+        raise OSError("connexion refusée")
+        yield  # pragma: no cover
+
+
+async def collect_trades(feed, pairs):
+    return [t async for t in feed.trades(pairs)]
+
+
+def test_bascule_des_transactions():
+    static = StaticFeed()
+    static.add_trade("BTCUSDT", "100", "2")
+    feed = FallbackFeed([BrokenTradesFeed(), SilentFeed(), static])  # SilentFeed : pas de transactions, sautée
+    assert feed.has_trades
+    (trade,) = asyncio.run(collect_trades(feed, ["BTCUSDT"]))
+    assert (trade.price, trade.quantity, trade.source) == (D("100"), D("2"), "Simulé")
+    assert feed.trade_errors == ["Panne : connexion refusée"] and feed.errors == []
+
+
+def test_aucune_source_de_transactions():
+    feed = FallbackFeed([BrokenFeed(), SilentFeed()])
+    assert not feed.has_trades
+    with pytest.raises(FeedUnavailable, match="Aucune source de transactions"):
+        asyncio.run(collect_trades(feed, ["BTCUSDT"]))
+
+
+def test_static_feed_n_envoie_chaque_transaction_qu_une_fois():
+    feed = StaticFeed()
+    feed.add_trade("BTCUSDT", "100", "1")
+    feed.add_trade("ETHUSDT", "10", "1")
+    assert [t.pair for t in asyncio.run(collect_trades(feed, ["BTCUSDT", "ETHUSDT"]))] == ["BTCUSDT", "ETHUSDT"]
+    assert asyncio.run(collect_trades(feed, ["BTCUSDT"])) == []

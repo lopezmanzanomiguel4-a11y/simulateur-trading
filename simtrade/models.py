@@ -55,6 +55,17 @@ class Quote:
         return self.spread / self.mid * 100
 
 
+@dataclass(frozen=True)
+class Trade:
+    """Transaction exécutée sur la place de marché (sert au volume et au VWAP)."""
+
+    pair: str
+    price: Decimal
+    quantity: Decimal
+    source: str
+    received_at: datetime
+
+
 @dataclass
 class Position:
     pair: str

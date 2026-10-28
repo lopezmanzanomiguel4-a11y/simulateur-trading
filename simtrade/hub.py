@@ -1,7 +1,8 @@
 """Flux de prix partagé pour un processus permanent (API).
 
-PriceHub garde UNE connexion ouverte et met à jour un cache {paire: Quote} ;
-CachedFeed expose ce cache comme une PriceFeed ordinaire pour TradingService.
+PriceHub garde UNE connexion de cotations ouverte et met à jour un cache {paire: Quote},
+plus une connexion de transactions (volume) si la source en fournit ; les deux alimentent
+les bougies (MarketData). CachedFeed expose le cache comme une PriceFeed ordinaire pour TradingService.
 """
 
 from __future__ import annotations
@@ -10,16 +11,28 @@ import asyncio
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import aclosing
+from dataclasses import dataclass
 from datetime import datetime
+from typing import Any
 
 from simtrade.errors import FeedUnavailable
 from simtrade.feeds.base import PriceFeed
-from simtrade.models import PAIRS, Quote, utcnow
+from simtrade.market import MarketData
+from simtrade.models import PAIRS, Quote, Trade, utcnow
 
 log = logging.getLogger("simtrade.hub")
 
 MAX_QUOTE_AGE = 5.0  # secondes
 SUBSCRIBER_QUEUE = 100
+
+
+@dataclass
+class LinkStatus:
+    """État d'une connexion du hub (cotations ou transactions)."""
+
+    connected: bool = False
+    last_error: str | None = None
+    reconnects: int = 0
 
 
 class PriceHub:
@@ -30,6 +43,7 @@ class PriceHub:
         *,
         max_backoff: float = 30,
         sleep: Callable[[float], Awaitable[object]] = asyncio.sleep,
+        market: MarketData | None = None,
     ):
         if feed is None:
             from simtrade.feeds import default_feed
@@ -39,47 +53,86 @@ class PriceHub:
         self.pairs = list(pairs)
         self.max_backoff = max_backoff
         self._sleep = sleep
+        self.market = market if market is not None else MarketData(self.pairs)
         self.quotes: dict[str, Quote] = {}
-        self.connected = False
         self.source: str | None = None
         self.last_quote_at: datetime | None = None
-        self.last_error: str | None = None
-        self.reconnects = 0
+        self.status = LinkStatus()  # connexion des cotations
+        self.trade_status = LinkStatus()  # connexion des transactions
+        self.last_trade_at: datetime | None = None
         self._subscribers: set[asyncio.Queue[Quote]] = set()
 
+    @property
+    def connected(self) -> bool:
+        return self.status.connected
+
+    @property
+    def last_error(self) -> str | None:
+        return self.status.last_error
+
+    @property
+    def reconnects(self) -> int:
+        return self.status.reconnects
+
     def update(self, quote: Quote) -> None:
-        """Met à jour le cache et prévient les abonnés (les plus lents perdent leurs anciennes cotations)."""
+        """Met à jour le cache et les bougies, prévient les abonnés (les plus lents perdent leurs anciennes cotations)."""
         self.quotes[quote.pair] = quote
         self.source = quote.source
         self.last_quote_at = quote.received_at
+        self.market.add_quote(quote)
         for queue in self._subscribers:
             if queue.full():
                 queue.get_nowait()
             queue.put_nowait(quote)
 
+    def update_trade(self, trade: Trade) -> None:
+        self.last_trade_at = trade.received_at
+        self.market.add_trade(trade)
+
     async def run(self) -> None:
-        """Tourne jusqu'à annulation ; se reconnecte avec un délai de 1, 2, 4... max_backoff secondes."""
+        """Tourne jusqu'à annulation : cotations, et transactions si la source en fournit."""
+        if not self.feed.has_trades:
+            await self.run_quotes()
+            return
+        async with asyncio.TaskGroup() as tg:
+            tg.create_task(self.run_quotes())
+            tg.create_task(self.run_trades())
+
+    async def run_quotes(self) -> None:
+        await self._run_loop(self.feed.stream, self.update, self.status, "de prix")
+
+    async def run_trades(self) -> None:
+        await self._run_loop(self.feed.trades, self.update_trade, self.trade_status, "de transactions")
+
+    async def _run_loop(
+        self,
+        open_stream: Callable[[Sequence[str]], AsyncIterator[Any]],
+        on_item: Callable[[Any], None],
+        status: LinkStatus,
+        label: str,
+    ) -> None:
+        """Se reconnecte avec un délai de 1, 2, 4... max_backoff secondes."""
         delay = 1.0
         while True:
             received = False
             try:
-                async with aclosing(self.feed.stream(self.pairs)) as stream:
-                    async for quote in stream:
+                async with aclosing(open_stream(self.pairs)) as stream:
+                    async for item in stream:
                         received = True
-                        self.connected = True
-                        self.update(quote)
-                self.last_error = "flux terminé"
+                        status.connected = True
+                        on_item(item)
+                status.last_error = "flux terminé"
             except asyncio.CancelledError:
-                self.connected = False
+                status.connected = False
                 raise
             except Exception as exc:  # réseau, toutes les sources injoignables...
-                self.last_error = str(exc) or type(exc).__name__
-            self.connected = False
+                status.last_error = str(exc) or type(exc).__name__
+            status.connected = False
             if received:
                 delay = 1.0
-            log.warning("Flux de prix coupé (%s), reconnexion dans %g s.", self.last_error, delay)
+            log.warning("Flux %s coupé (%s), reconnexion dans %g s.", label, status.last_error, delay)
             await self._sleep(delay)
-            self.reconnects += 1
+            status.reconnects += 1
             delay = min(delay * 2, self.max_backoff)
 
     async def subscribe(self, pairs: Sequence[str] = PAIRS) -> AsyncIterator[Quote]:

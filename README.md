@@ -1,7 +1,7 @@
 # Simulateur de paper trading crypto
 
 Simulateur d'achat/vente de cryptomonnaies **avec de l'argent fictif** et des **prix réels**, en ligne de commande ou via une API HTTP locale.
-Étapes 1 et 2 d'un projet qui recevra plus tard une interface.
+Étapes 1 à 3 d'un projet qui recevra plus tard une interface.
 
 ## Ce que ça fait
 
@@ -13,6 +13,7 @@ Simulateur d'achat/vente de cryptomonnaies **avec de l'argent fictif** et des **
 - **Refus clairs** des ordres impossibles : solde insuffisant, vente sans position, quantité supérieure à ce qu'on détient, montant trop faible, paire inconnue.
 - **Capital de départ paramétrable** (10 000 USDT par défaut, maximum 10 000 000).
 - **Persistance SQLite** : le portefeuille survit à un redémarrage.
+- **Calculs de marché** (API) : bougies OHLC 1m, 5m, 15m et 1h construites en direct, volume réel, SMA, EMA, RSI, VWAP et variation sur la période.
 
 ## Installation (Windows / PowerShell)
 
@@ -76,7 +77,7 @@ $env:SIMTRADE_DB = "C:\chemin\vers\autre.db"
 python -m simtrade api
 ```
 
-Lance un serveur local sur `http://127.0.0.1:8000` (pas accessible depuis le réseau). Il garde **une seule** connexion websocket de prix ouverte (Binance, sinon Coinbase) et met les cotations en cache : les ordres sont exécutés instantanément au dernier prix reçu. Si le flux tombe, il se reconnecte tout seul (attente de 1, 2, 4… jusqu'à 30 s). Un ordre n'est jamais exécuté sur une cotation de plus de 5 s (erreur 503) ; `/prix` renvoie quand même tout le cache, avec `"perime": true` pour ces cotations (503 seulement si aucune cotation n'a encore été reçue). Documentation interactive : `http://127.0.0.1:8000/docs`.
+Lance un serveur local sur `http://127.0.0.1:8000` (pas accessible depuis le réseau). Il garde **une seule** connexion websocket de cotations ouverte (Binance, sinon Coinbase) et met les cotations en cache : les ordres sont exécutés instantanément au dernier prix reçu. Une **seconde** connexion reçoit les transactions exécutées (Binance `aggTrade`, sinon Coinbase `matches`) pour le volume. Si un flux tombe, il se reconnecte tout seul (attente de 1, 2, 4… jusqu'à 30 s), indépendamment de l'autre. Un ordre n'est jamais exécuté sur une cotation de plus de 5 s (erreur 503) ; `/prix` renvoie quand même tout le cache, avec `"perime": true` pour ces cotations (503 seulement si aucune cotation n'a encore été reçue). Documentation interactive : `http://127.0.0.1:8000/docs`.
 
 | Méthode | Route | Corps JSON | Réponse |
 |---|---|---|---|
@@ -86,7 +87,9 @@ Lance un serveur local sur `http://127.0.0.1:8000` (pas accessible depuis le ré
 | GET | `/portefeuille` | | positions, valeur, P&L, frais, performance |
 | GET | `/historique` | | compte actif + ordres |
 | POST | `/reset` | `{"capital": "2500"}` (facultatif, défaut 10000) | nouveau compte |
-| GET | `/info` | | chemin de la base, compte actif, état du flux |
+| GET | `/info` | | chemin de la base, compte actif, état des flux (`flux`, `flux_volume`) |
+| GET | `/bougies/{paire}?intervalle=1m&limite=100` | | bougies OHLC, volume, notional, `cloturee` |
+| GET | `/indicateurs/{paire}?intervalle=1m&fenetre=500&sma=20&ema=20&rsi=14` | | SMA, EMA, RSI, VWAP, variation, volume |
 | WS | `/ws/prix` | | chaque cotation en direct (d'abord le cache, puis les mises à jour) |
 
 **Nombres** : envoyés et renvoyés **en chaîne** (`"0.00000001"`, jamais de float ni de `1E-8`). Un nombre JSON (`"montant": 500`) est refusé.
@@ -107,13 +110,39 @@ curl.exe http://127.0.0.1:8000/info
 
 La CLI et l'API utilisent la même base SQLite : un ordre passé dans l'une apparaît dans l'autre.
 
+### Calculs de marché
+
+Les bougies sont construites **en mémoire, depuis le démarrage de l'API** : au lancement il n'y en a aucune, et un indicateur vaut `null` tant qu'il n'y a pas assez de bougies (un RSI 14 en 1 min demande 15 min). Intervalles : `1m`, `5m`, `15m`, `1h`, 500 bougies maximum par paire et par intervalle.
+
+- **OHLC** sur le mid $m = \dfrac{\text{bid} + \text{ask}}{2}$, horodaté à la réception, bougies alignées sur l'heure UTC.
+- **Volume** $V$ (quantité échangée) et **notional** $N = \sum_k p_k \, q_k$ à partir des transactions.
+- Une minute sans cotation donne une **bougie plate** (clôture précédente, volume nul) ; une cotation arrivée après la fin de sa bougie est ignorée.
+- Les indicateurs portent sur les `fenetre` dernières bougies, **bougie en cours comprise**, arrondis à 8 décimales.
+
+Notations : $c_t$ la clôture de la bougie $t$ (la dernière est $c_T$), $o_1$ l'ouverture de la première bougie de la fenêtre.
+
+| Indicateur | Formule |
+|---|---|
+| SMA | $\text{SMA}_n = \dfrac{1}{n} \sum_{t=T-n+1}^{T} c_t$ |
+| EMA | $E_n = \dfrac{1}{n} \sum_{t=1}^{n} c_t$, puis $E_t = \alpha \, c_t + (1-\alpha) \, E_{t-1}$ avec $\alpha = \dfrac{2}{n+1}$ |
+| RSI (Wilder) | $\Delta_t = c_t - c_{t-1}$ ; $H$ et $B$ = moyennes des hausses $\max(\Delta_t, 0)$ et des baisses $\max(-\Delta_t, 0)$ sur les $n$ premières variations, puis $H_t = \dfrac{(n-1)\,H_{t-1} + \max(\Delta_t,0)}{n}$ (idem pour $B$) ; $\text{RSI} = 100 - \dfrac{100}{1 + H/B}$, 100 si $B = 0$, 50 si $H = B = 0$ |
+| VWAP | $\dfrac{\sum_t N_t}{\sum_t V_t}$ sur la fenêtre (`null` si aucun volume) |
+| Variation | $\dfrac{c_T - o_1}{o_1} \times 100$ |
+
+```powershell
+curl.exe "http://127.0.0.1:8000/bougies/btc?intervalle=5m&limite=10"
+curl.exe "http://127.0.0.1:8000/indicateurs/eth?intervalle=1m&rsi=14&sma=20"
+```
+
+Paramètre invalide (intervalle inconnu, entier illisible, hors de 1 à 500) : erreur 400.
+
 ## Tests
 
 ```powershell
 python -m pytest
 ```
 
-Les tests couvrent le moteur (frais, prix moyen, P&L réalisé/latent, performance, refus d'ordres, validation du capital), la persistance (redémarrage, reset, transactions), le parsing des messages Binance/Coinbase, la bascule entre sources, les commandes CLI, les routes de l'API, la reconnexion du flux et le refus des cotations périmées. Ils utilisent des prix simulés et ne touchent pas au réseau.
+Les tests couvrent le moteur (frais, prix moyen, P&L réalisé/latent, performance, refus d'ordres, validation du capital), la persistance (redémarrage, reset, transactions), le parsing des messages Binance/Coinbase, la bascule entre sources, les commandes CLI, les routes de l'API, la reconnexion du flux, le refus des cotations périmées, la construction des bougies, les indicateurs (valeurs calculées à la main) et les routes de marché. Ils utilisent des prix simulés et ne touchent pas au réseau.
 
 ## Architecture
 
@@ -124,7 +153,8 @@ simtrade/
   storage.py   SQLite : comptes, positions, ordres
   feeds/       sources de prix : Binance, Coinbase, bascule, source simulée
   service.py   TradingService : point d'entrée unique des interfaces
-  hub.py       PriceHub (une connexion partagée, cache, reconnexion) et CachedFeed (lecture du cache)
+  market.py    calculs de marché purs : bougies OHLC, SMA, EMA, RSI, VWAP, variation (aucun I/O)
+  hub.py       PriceHub (connexions partagées cotations + transactions, cache, bougies, reconnexion) et CachedFeed
   api.py       API FastAPI : create_app(), routes, websocket /ws/prix
   cli.py       ligne de commande
 ```
@@ -139,6 +169,10 @@ L'API ne fait qu'appeler `TradingService`, qui reçoit un `CachedFeed` à la pla
 - **CLI : une connexion websocket par commande** : chaque commande met 1 à 4 s à obtenir un prix (le temps d'établir la connexion). L'API n'a pas ce délai.
 - **Coinbase en secours est moins liquide en USDT** : le spread BTC-USDT y est nettement plus large que sur Binance (constaté : environ 3,5 pb contre moins de 0,01 pb), et le canal ticker ne se met à jour qu'à chaque transaction.
 - CLI : pas de reconnexion automatique si le flux continu `prix` est coupé en cours de route (l'API, elle, se reconnecte).
+- **Bougies perdues au redémarrage de l'API** : pas d'historique préchargé ni sauvegardé, et rien pendant que l'API est arrêtée.
+- **Bougies basées sur l'heure de réception**, pas sur l'heure de la place : un retard réseau peut faire glisser une cotation dans la bougie suivante.
+- **Volume** : celui de la source qui répond (Binance ou Coinbase), pas un volume global du marché. Sur Coinbase, les paires USDT sont peu échangées : volume faible, VWAP peu représentatif. Les deux flux peuvent venir de sources différentes après une bascule.
+- Ouvrir l'API ouvre **deux** connexions websocket (cotations et transactions) au lieu d'une.
 - API sans authentification : elle n'écoute que sur 127.0.0.1, ne pas l'exposer sur le réseau.
 - Un seul utilisateur, un seul compte actif à la fois.
 - Simulation pédagogique : ni conseil financier, ni lien avec un vrai compte.
