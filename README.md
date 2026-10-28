@@ -1,7 +1,7 @@
 # Simulateur de paper trading crypto
 
-Simulateur d'achat/vente de cryptomonnaies **avec de l'argent fictif** et des **prix réels**, en ligne de commande.
-Étape 1 d'un projet qui recevra plus tard une API (FastAPI) et une interface.
+Simulateur d'achat/vente de cryptomonnaies **avec de l'argent fictif** et des **prix réels**, en ligne de commande ou via une API HTTP locale.
+Étapes 1 et 2 d'un projet qui recevra plus tard une interface.
 
 ## Ce que ça fait
 
@@ -40,6 +40,7 @@ python -m simtrade reset                # nouveau compte à 10 000 USDT (demande
 python -m simtrade reset 2500           # nouveau compte à 2 500 USDT
 python -m simtrade reset 2500 --yes     # sans confirmation
 python -m simtrade info                 # chemin de la base, compte actif
+python -m simtrade api                  # lance l'API sur http://127.0.0.1:8000 (voir plus bas)
 ```
 
 Les paires s'écrivent `BTCUSDT`, `btc`, `BTC/USDT` ou `btc-usdt`. Les nombres acceptent le point ou la virgule (`0,05`).
@@ -69,13 +70,50 @@ La base est stockée dans `%LOCALAPPDATA%\simtrade\simtrade.db` (hors du projet 
 $env:SIMTRADE_DB = "C:\chemin\vers\autre.db"
 ```
 
+## API (FastAPI)
+
+```powershell
+python -m simtrade api
+```
+
+Lance un serveur local sur `http://127.0.0.1:8000` (pas accessible depuis le réseau). Il garde **une seule** connexion websocket de prix ouverte (Binance, sinon Coinbase) et met les cotations en cache : les ordres sont exécutés instantanément au dernier prix reçu. Si le flux tombe, il se reconnecte tout seul (attente de 1, 2, 4… jusqu'à 30 s). Une cotation de plus de 5 s est refusée (erreur 503) plutôt qu'utilisée. Documentation interactive : `http://127.0.0.1:8000/docs`.
+
+| Méthode | Route | Corps JSON | Réponse |
+|---|---|---|---|
+| GET | `/prix` | | bid, ask, spread, source, heure et âge de chaque cotation |
+| POST | `/ordres/achat` | `{"paire": "btc", "montant": "500"}` | ordre exécuté + solde |
+| POST | `/ordres/vente` | `{"paire": "eth", "quantite": "0.05"}` ou `"tout"` | ordre exécuté + solde |
+| GET | `/portefeuille` | | positions, valeur, P&L, frais, performance |
+| GET | `/historique` | | compte actif + ordres |
+| POST | `/reset` | `{"capital": "2500"}` (facultatif, défaut 10000) | nouveau compte |
+| GET | `/info` | | chemin de la base, compte actif, état du flux |
+| WS | `/ws/prix` | | chaque cotation en direct (d'abord le cache, puis les mises à jour) |
+
+**Nombres** : envoyés et renvoyés **en chaîne** (`"0.00000001"`, jamais de float ni de `1E-8`). Un nombre JSON (`"montant": 500`) est refusé.
+
+**Erreurs** : `{"erreur": "<message>"}` avec le code 400 (saisie invalide, capital refusé, ordre impossible) ou 503 (pas de prix frais).
+
+Exemples dans un second terminal PowerShell. Il faut écrire `curl.exe` (dans Windows PowerShell, `curl` seul est un alias d'`Invoke-WebRequest`) et échapper les guillemets du JSON avec `\"` :
+
+```powershell
+curl.exe http://127.0.0.1:8000/prix
+curl.exe -X POST http://127.0.0.1:8000/ordres/achat -H "Content-Type: application/json" -d '{\"paire\": \"btc\", \"montant\": \"500\"}'
+curl.exe -X POST http://127.0.0.1:8000/ordres/vente -H "Content-Type: application/json" -d '{\"paire\": \"btc\", \"quantite\": \"tout\"}'
+curl.exe http://127.0.0.1:8000/portefeuille
+curl.exe http://127.0.0.1:8000/historique
+curl.exe -X POST http://127.0.0.1:8000/reset -H "Content-Type: application/json" -d '{\"capital\": \"2500\"}'
+curl.exe http://127.0.0.1:8000/info
+```
+
+La CLI et l'API utilisent la même base SQLite : un ordre passé dans l'une apparaît dans l'autre.
+
 ## Tests
 
 ```powershell
 python -m pytest
 ```
 
-Les tests couvrent le moteur (frais, prix moyen, P&L réalisé/latent, performance, refus d'ordres, validation du capital), la persistance (redémarrage, reset, transactions), le parsing des messages Binance/Coinbase, la bascule entre sources et les commandes CLI. Ils utilisent des prix simulés et ne touchent pas au réseau.
+Les tests couvrent le moteur (frais, prix moyen, P&L réalisé/latent, performance, refus d'ordres, validation du capital), la persistance (redémarrage, reset, transactions), le parsing des messages Binance/Coinbase, la bascule entre sources, les commandes CLI, les routes de l'API, la reconnexion du flux et le refus des cotations périmées. Ils utilisent des prix simulés et ne touchent pas au réseau.
 
 ## Architecture
 
@@ -86,18 +124,21 @@ simtrade/
   storage.py   SQLite : comptes, positions, ordres
   feeds/       sources de prix : Binance, Coinbase, bascule, source simulée
   service.py   TradingService : point d'entrée unique des interfaces
+  hub.py       PriceHub (une connexion partagée, cache, reconnexion) et CachedFeed (lecture du cache)
+  api.py       API FastAPI : create_app(), routes, websocket /ws/prix
   cli.py       ligne de commande
 ```
 
-Une future API FastAPI n'aura qu'à appeler `TradingService` (ses méthodes réseau sont déjà `async`).
+L'API ne fait qu'appeler `TradingService`, qui reçoit un `CachedFeed` à la place d'une connexion directe.
 
 ## Limites
 
 - **Tout est en USDT.** Pas de conversion en EUR, pas d'autres paires que les trois listées.
 - **Pas de carnet d'ordres complet** : seul le meilleur bid/ask est utilisé. Un gros ordre est exécuté entièrement à ce prix, sans glissement (*slippage*), ce qui est optimiste pour de gros montants.
 - **Ordres au marché uniquement** : pas d'ordres limites ni de stop pour l'instant.
-- **Une connexion websocket par commande** : chaque commande met 1 à 4 s à obtenir un prix (le temps d'établir la connexion). Un processus permanent (API) supprimera ce délai.
+- **CLI : une connexion websocket par commande** : chaque commande met 1 à 4 s à obtenir un prix (le temps d'établir la connexion). L'API n'a pas ce délai.
 - **Coinbase en secours est moins liquide en USDT** : le spread BTC-USDT y est nettement plus large que sur Binance (constaté : environ 3,5 pb contre moins de 0,01 pb), et le canal ticker ne se met à jour qu'à chaque transaction.
-- Pas de reconnexion automatique si le flux continu `prix` est coupé en cours de route.
+- CLI : pas de reconnexion automatique si le flux continu `prix` est coupé en cours de route (l'API, elle, se reconnecte).
+- API sans authentification : elle n'écoute que sur 127.0.0.1, ne pas l'exposer sur le réseau.
 - Un seul utilisateur, un seul compte actif à la fois.
 - Simulation pédagogique : ni conseil financier, ni lien avec un vrai compte.

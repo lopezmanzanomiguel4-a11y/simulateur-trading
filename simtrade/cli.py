@@ -48,11 +48,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--yes", "-y", action="store_true", help="ne demande pas de confirmation")
 
     sub.add_parser("info", help="chemin de la base et comptes enregistrés")
+    sub.add_parser("api", help="lance l'API HTTP sur http://127.0.0.1:8000")
     return parser
 
 
 def main(argv: Sequence[str] | None = None, service: TradingService | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.command == "api":
+        return cmd_api()  # l'API ouvre sa propre base dans son lifespan
     service = service or build_service()
     try:
         handler = COMMANDS[args.command]
@@ -262,6 +265,13 @@ def cmd_info(service: TradingService, args: argparse.Namespace) -> int:
     print(f"(modifiable avec la variable d'environnement {DB_ENV_VAR})")
     print(f"Compte actif : n°{active.id}, {fmt.usdt(active.initial_capital)} au {local(active.created_at)}")
     print(f"Comptes archivés : {len(accounts) - 1}")
+    return 0
+
+
+def cmd_api() -> int:
+    from simtrade.api import run  # import paresseux : FastAPI n'est chargé que pour l'API
+
+    run()
     return 0
 
 
