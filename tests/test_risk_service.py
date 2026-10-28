@@ -60,11 +60,34 @@ def test_tout_le_capital_sans_stop_refuse_et_journalise(env):
     assert record.state["valeur_compte"] == "10000.00" and record.amount == D("10000")
 
 
-def test_echec_du_stop_annule_l_achat(env):
+def test_objectif_invalide_refuse_avant_l_achat(env):
     with pytest.raises(OrderRejected, match="exécuté immédiatement"):
-        enter(env, stop="95", target="99")  # objectif sous le bid : refusé après l'achat simulé
+        enter(env, stop="95", target="99")  # objectif sous le bid : contrôlé avant l'achat
     assert robot_orders(env) == [] and protection(env) == []
     assert env.service.account("robot").cash == D("10000")
+
+
+def test_echec_de_la_pose_du_stop_annule_l_achat_deja_passe(env, monkeypatch):
+    """Rollback réel : l'achat est enregistré, puis la pose du stop échoue dans la même transaction."""
+    saved = []
+    real_save = env.storage.save_trade
+
+    def save_then_record(portfolio, order):
+        saved.append(real_save(portfolio, order))
+        return saved[-1]
+
+    def broken_add_pending(orders):
+        raise RuntimeError("panne pendant la pose du stop")
+
+    monkeypatch.setattr(env.storage, "save_trade", save_then_record)
+    monkeypatch.setattr(env.storage, "add_pending", broken_add_pending)
+    with pytest.raises(RuntimeError, match="panne"):
+        enter(env)
+    assert len(saved) == 1  # l'achat avait bien été écrit avant la panne
+    monkeypatch.undo()
+    assert robot_orders(env) == [] and protection(env) == []
+    assert env.service.account("robot").cash == D("10000")
+    assert env.service.load_portfolio(compte="robot").positions == {}
 
 
 def test_compte_manuel_jamais_filtre(env):
