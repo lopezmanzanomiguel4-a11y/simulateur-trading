@@ -34,7 +34,7 @@ Architecture :
 | 1 | Moteur (prix réels, ordres, portefeuille, persistance SQLite) | ✅ |
 | 2 | API (FastAPI, PriceHub, cache de prix) | ✅ |
 | 3 | Calculs de marché (bougies, SMA/EMA/RSI/VWAP, historique Binance) | ✅ |
-| 4 | Ordres avancés, sessions intraday et comptes multiples | ⬜ |
+| 4 | Ordres avancés, sessions intraday et comptes multiples | ✅ |
 | 5 | Garde-fou de risque | ⬜ |
 | 6 | Briques et stratégies intraday (exécution rapide) | ⬜ |
 | 7 | Journal, statistiques et backtest → catalogue | ⬜ |

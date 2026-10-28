@@ -1,21 +1,38 @@
-"""Persistance SQLite : comptes, positions, ordres.
+"""Persistance SQLite : comptes, positions, ordres, ordres en attente, sessions, réglages.
 
 Les montants sont stockés en TEXT pour garder la précision exacte des Decimal.
-Un reset ne supprime rien : il archive le compte actif et en ouvre un nouveau.
+Un reset ne supprime rien : il archive le compte et en ouvre un nouveau du même nom.
+Plusieurs comptes peuvent être ouverts en parallèle ; le compte « courant » (active = 1)
+est celui utilisé quand aucun compte n'est précisé.
 """
 
 from __future__ import annotations
 
+import re
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import replace
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
 
+from simtrade import migrations
 from simtrade.engine import DEFAULT_CAPITAL, Portfolio, validate_capital
-from simtrade.models import Account, Order, Position, Side, utcnow
+from simtrade.errors import InvalidInput
+from simtrade.models import (
+    CANCELLED,
+    MANUAL,
+    MODES,
+    PENDING,
+    Account,
+    Order,
+    PendingOrder,
+    Position,
+    Side,
+    utcnow,
+)
+from simtrade.sessions import SessionRules, parse_hhmm
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS accounts (
@@ -51,6 +68,10 @@ CREATE TABLE IF NOT EXISTS orders (
 );
 CREATE INDEX IF NOT EXISTS orders_by_account ON orders(account_id, id);
 """
+# Schéma de départ (v0) ; les ajouts de l'étape 4 sont dans migrations.py.
+
+DEFAULT_NAME = "principal"
+NAME_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}")
 
 
 class Storage:
@@ -62,6 +83,11 @@ class Storage:
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.executescript(SCHEMA)
+        try:
+            self.backup_path = migrations.migrate(self.conn, self.path)
+        except BaseException:
+            self.conn.close()
+            raise
 
     def close(self) -> None:
         self.conn.close()
@@ -80,39 +106,126 @@ class Storage:
             raise
         self.conn.execute("COMMIT")
 
+    def data_version(self) -> int:
+        """Change quand une AUTRE connexion (la CLI pendant que l'API tourne) a écrit dans la base."""
+        return self.conn.execute("PRAGMA data_version").fetchone()[0]
+
     # --- Comptes ---
 
     def active_account(self) -> Account:
-        """Compte actif ; en crée un avec le capital par défaut au premier lancement."""
+        """Compte courant ; en crée un avec le capital par défaut au premier lancement."""
         with self.transaction():
             row = self.conn.execute("SELECT * FROM accounts WHERE active = 1").fetchone()
-            if row is None:
-                return self._open_account(DEFAULT_CAPITAL, utcnow())
-            return _account(row)
+            if row is not None:
+                return _account(row)
+            row = self.conn.execute(
+                "SELECT * FROM accounts WHERE name = ? AND archived_at IS NULL", (DEFAULT_NAME,)
+            ).fetchone()
+            if row is not None:
+                self.conn.execute("UPDATE accounts SET active = 1 WHERE id = ?", (row["id"],))
+                return replace(_account(row), current=True)
+            return self._open_account(DEFAULT_CAPITAL, utcnow())
 
     def accounts(self) -> list[Account]:
         rows = self.conn.execute("SELECT * FROM accounts ORDER BY id").fetchall()
         return [_account(r) for r in rows]
 
-    def reset(self, capital: object = DEFAULT_CAPITAL, now: datetime | None = None) -> Account:
-        """Archive le compte actif (ordres conservés) et ouvre un compte neuf."""
+    def open_accounts(self) -> list[Account]:
+        self.active_account()  # premier lancement
+        rows = self.conn.execute("SELECT * FROM accounts WHERE archived_at IS NULL ORDER BY id").fetchall()
+        return [_account(r) for r in rows]
+
+    def account(self, ref: object = None, *, open_only: bool = True) -> Account:
+        """Compte par nom (parmi les ouverts) ou par numéro ; le compte courant si `ref` est None."""
+        current = self.active_account()  # premier lancement : crée le compte principal
+        if ref is None or (isinstance(ref, str) and not ref.strip()):
+            return current
+        text = str(ref).strip().lower()
+        if text.isdigit():
+            row = self.conn.execute("SELECT * FROM accounts WHERE id = ?", (int(text),)).fetchone()
+        else:
+            row = self.conn.execute(
+                "SELECT * FROM accounts WHERE name = ? AND archived_at IS NULL", (text,)
+            ).fetchone()
+        if row is None:
+            names = ", ".join(a.name for a in self.open_accounts())
+            raise InvalidInput(f"Compte inconnu : '{ref}'. Comptes ouverts : {names}.")
+        account = _account(row)
+        if open_only and account.archived:
+            raise InvalidInput(f"Le compte n°{account.id} ({account.name}) est archivé.")
+        return account
+
+    def create_account(
+        self, name: object, capital: object = DEFAULT_CAPITAL, mode: str = MANUAL, now: datetime | None = None
+    ) -> Account:
+        clean = str(name).strip().lower()
+        if not NAME_RE.fullmatch(clean) or clean.isdigit():
+            raise InvalidInput(
+                f"Nom de compte invalide : '{name}' (1 à 32 caractères parmi a-z, 0-9, - et _, pas uniquement des chiffres)."
+            )
+        if mode not in MODES:
+            raise InvalidInput(f"Mode de compte invalide : '{mode}' ({' ou '.join(MODES)}).")
         amount = validate_capital(capital)
         with self.transaction():
-            self.conn.execute("UPDATE accounts SET active = 0 WHERE active = 1")
-            return self._open_account(amount, now or utcnow())
+            self.active_account()  # le compte principal existe avant les autres
+            taken = self.conn.execute(
+                "SELECT 1 FROM accounts WHERE name = ? AND archived_at IS NULL", (clean,)
+            ).fetchone()
+            if taken:
+                raise InvalidInput(f"Un compte ouvert s'appelle déjà '{clean}'.")
+            return self._open_account(amount, now or utcnow(), clean, mode, current=False)
 
-    def _open_account(self, capital: Decimal, now: datetime) -> Account:
-        cur = self.conn.execute(
-            "INSERT INTO accounts (initial_capital, cash, created_at, active) VALUES (?, ?, ?, 1)",
-            (str(capital), str(capital), now.isoformat()),
+    def select_account(self, ref: object) -> Account:
+        with self.transaction():
+            account = self.account(ref)
+            self.conn.execute("UPDATE accounts SET active = 0 WHERE active = 1")
+            self.conn.execute("UPDATE accounts SET active = 1 WHERE id = ?", (account.id,))
+        return replace(account, current=True)
+
+    def archive_account(self, ref: object, now: datetime | None = None) -> Account:
+        now = now or utcnow()
+        with self.transaction():
+            account = self.account(ref)
+            if account.current:
+                raise InvalidInput(
+                    f"'{account.name}' est le compte courant : choisis-en un autre avant de l'archiver (ou utilise reset)."
+                )
+            self._archive(account.id, now, "archive")
+        return replace(account, archived_at=now)
+
+    def reset(self, capital: object = DEFAULT_CAPITAL, now: datetime | None = None, account: object = None) -> Account:
+        """Archive le compte (le courant par défaut, ordres conservés) et ouvre un compte neuf du même nom."""
+        amount = validate_capital(capital)
+        now = now or utcnow()
+        with self.transaction():
+            old = self.account(account)
+            self._archive(old.id, now, "reset")
+            return self._open_account(amount, now, old.name, old.mode, current=old.current)
+
+    def _archive(self, account_id: int, now: datetime, reason: str) -> None:
+        self.cancel_account_pending(account_id, reason, now)
+        self.conn.execute(
+            "UPDATE accounts SET active = 0, archived_at = ? WHERE id = ?", (now.isoformat(), account_id)
         )
-        return Account(cur.lastrowid, capital, capital, now)
+
+    def _open_account(
+        self, capital: Decimal, now: datetime, name: str = DEFAULT_NAME, mode: str = MANUAL, current: bool = True
+    ) -> Account:
+        cur = self.conn.execute(
+            "INSERT INTO accounts (initial_capital, cash, created_at, active, name, mode) VALUES (?, ?, ?, ?, ?, ?)",
+            (str(capital), str(capital), now.isoformat(), 1 if current else 0, name, mode),
+        )
+        return Account(cur.lastrowid, capital, capital, now, name, mode, None, current)
 
     # --- Portefeuille ---
 
-    def load_portfolio(self) -> Portfolio:
+    def load_portfolio(self, account_id: int | None = None, *, exclude_pending: int | None = None) -> Portfolio:
+        """Portefeuille du compte (courant par défaut), avec ce que bloquent ses ordres en attente.
+
+        `exclude_pending` : ordre en attente (et son ordre lié) à ne pas compter, pour l'exécuter.
+        """
         with self.transaction():
-            account = self.active_account()
+            account = self.active_account() if account_id is None else self.account(account_id, open_only=False)
             positions = {
                 r["pair"]: Position(r["pair"], Decimal(r["quantity"]), Decimal(r["cost_basis"]))
                 for r in self.conn.execute("SELECT * FROM positions WHERE account_id = ?", (account.id,))
@@ -122,7 +235,13 @@ class Storage:
             for r in self.conn.execute("SELECT realized_pnl, fee FROM orders WHERE account_id = ?", (account.id,)):
                 realized += Decimal(r["realized_pnl"])
                 fees += Decimal(r["fee"])
-        return Portfolio(account, positions, realized, fees)
+            pending = self.pending_orders(account.id)
+        if exclude_pending is not None:
+            excluded = next((p for p in pending if p.id == exclude_pending), None)
+            group = excluded.group_id if excluded else None
+            pending = [p for p in pending if p.id != exclude_pending and (group is None or p.group_id != group)]
+        reserved_cash, reserved_qty = _reservations(pending, positions)
+        return Portfolio(account, positions, realized, fees, reserved_cash=reserved_cash, reserved_qty=reserved_qty)
 
     def save_trade(self, portfolio: Portfolio, order: Order) -> Order:
         """Enregistre l'ordre et l'état du portefeuille qui en résulte, de façon atomique."""
@@ -143,7 +262,8 @@ class Storage:
                 )
             cur = self.conn.execute(
                 "INSERT INTO orders (account_id, pair, side, quantity, price, gross, fee, cash_flow, "
-                "realized_pnl, source, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "realized_pnl, source, created_at, kind, trigger_price, slippage, pending_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     account.id,
                     order.pair,
@@ -156,6 +276,10 @@ class Storage:
                     str(order.realized_pnl),
                     order.source,
                     order.created_at.isoformat(),
+                    order.kind,
+                    _opt_str(order.trigger_price),
+                    str(order.slippage),
+                    order.pending_id,
                 ),
             )
         return replace(order, account_id=account.id, id=cur.lastrowid)
@@ -167,6 +291,142 @@ class Storage:
         rows = self.conn.execute("SELECT * FROM orders WHERE account_id = ? ORDER BY id", (account_id,))
         return [_order(r) for r in rows]
 
+    # --- Ordres en attente ---
+
+    def add_pending(self, orders: Sequence[PendingOrder]) -> list[PendingOrder]:
+        """Enregistre un ordre, ou deux ordres liés (stop + objectif) qui partagent un groupe."""
+        saved: list[PendingOrder] = []
+        with self.transaction():
+            for order in orders:
+                cur = self.conn.execute(
+                    "INSERT INTO pending_orders (account_id, pair, kind, side, trigger_price, amount, quantity, "
+                    "status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        order.account_id,
+                        order.pair,
+                        order.kind,
+                        order.side.value,
+                        str(order.trigger_price),
+                        _opt_str(order.amount),
+                        _opt_str(order.quantity),
+                        PENDING,
+                        order.created_at.isoformat(),
+                    ),
+                )
+                saved.append(replace(order, id=cur.lastrowid, status=PENDING))
+            if len(saved) > 1:
+                group = saved[0].id
+                self.conn.execute(
+                    f"UPDATE pending_orders SET group_id = ? WHERE id IN ({','.join('?' * len(saved))})",
+                    (group, *(o.id for o in saved)),
+                )
+                saved = [replace(o, group_id=group) for o in saved]
+        return saved
+
+    def pending_orders(self, account_id: int | None = None, *, all_statuses: bool = False) -> list[PendingOrder]:
+        """Ordres en attente d'un compte (tous les comptes si None), du plus ancien au plus récent."""
+        sql, args = "SELECT * FROM pending_orders WHERE 1 = 1", []
+        if account_id is not None:
+            sql += " AND account_id = ?"
+            args.append(account_id)
+        if not all_statuses:
+            sql += " AND status = ?"
+            args.append(PENDING)
+        return [_pending(r) for r in self.conn.execute(sql + " ORDER BY id", args)]
+
+    def get_pending(self, pending_id: int) -> PendingOrder | None:
+        row = self.conn.execute("SELECT * FROM pending_orders WHERE id = ?", (pending_id,)).fetchone()
+        return None if row is None else _pending(row)
+
+    def group(self, order: PendingOrder) -> list[PendingOrder]:
+        if order.group_id is None:
+            return [order]
+        rows = self.conn.execute("SELECT * FROM pending_orders WHERE group_id = ? ORDER BY id", (order.group_id,))
+        return [_pending(r) for r in rows]
+
+    def close_pending(
+        self, pending_id: int, status: str, reason: str | None, now: datetime, order_id: int | None = None
+    ) -> None:
+        self.conn.execute(
+            "UPDATE pending_orders SET status = ?, reason = ?, closed_at = ?, order_id = ? "
+            "WHERE id = ? AND status = ?",
+            (status, reason, now.isoformat(), order_id, pending_id, PENDING),
+        )
+
+    def cancel_account_pending(self, account_id: int, reason: str, now: datetime) -> int:
+        cur = self.conn.execute(
+            "UPDATE pending_orders SET status = ?, reason = ?, closed_at = ? WHERE account_id = ? AND status = ?",
+            (CANCELLED, reason, now.isoformat(), account_id, PENDING),
+        )
+        return cur.rowcount
+
+    # --- Sessions ---
+
+    def record_session(self, account_id: int, day: date, now: datetime, late: bool) -> None:
+        self.conn.execute(
+            "INSERT INTO sessions (account_id, date, closed_at, late) VALUES (?, ?, ?, ?)",
+            (account_id, day.isoformat(), now.isoformat(), int(late)),
+        )
+
+    def sessions(self, account_id: int) -> list[tuple[date, datetime, bool]]:
+        rows = self.conn.execute("SELECT * FROM sessions WHERE account_id = ? ORDER BY id", (account_id,))
+        return [(date.fromisoformat(r["date"]), datetime.fromisoformat(r["closed_at"]), bool(r["late"])) for r in rows]
+
+    def last_session_close(self, account_id: int) -> datetime | None:
+        closes = [closed for _, closed, _ in self.sessions(account_id)]
+        return max(closes) if closes else None
+
+    def first_activity_since(self, account_id: int, since: datetime | None) -> datetime | None:
+        """Plus ancien ordre (exécuté ou en attente) du compte après `since` : début de la session à fermer."""
+        times = [o.created_at for o in self.orders(account_id)]
+        times += [p.created_at for p in self.pending_orders(account_id)]
+        times = [t for t in times if since is None or t > since]
+        return min(times) if times else None
+
+    # --- Réglages ---
+
+    def session_rules(self) -> SessionRules:
+        values = {r["key"]: r["value"] for r in self.conn.execute("SELECT key, value FROM settings")}
+        return SessionRules(
+            parse_hhmm(values["last_entry"], "Heure de dernière entrée"), parse_hhmm(values["close"], "Heure de clôture")
+        )
+
+    def set_session_rules(self, rules: SessionRules) -> None:
+        with self.transaction():
+            for key, value in (("last_entry", rules.last_entry), ("close", rules.close)):
+                self.conn.execute("UPDATE settings SET value = ? WHERE key = ?", (f"{value:%H:%M}", key))
+
+
+def _reservations(
+    pending: Sequence[PendingOrder], positions: dict[str, Position]
+) -> tuple[Decimal, dict[str, Decimal]]:
+    """USDT bloqués par les achats limites ; quantités bloquées par les ventes (un groupe lié compte une fois)."""
+    cash = sum((p.amount for p in pending if p.side is Side.BUY and p.amount is not None), Decimal(0))
+    by_group: dict[tuple[str, object], Decimal] = {}
+    for p in pending:
+        if p.side is not Side.SELL:
+            continue
+        held = positions[p.pair].quantity if p.pair in positions else Decimal(0)
+        qty = held if p.quantity is None else p.quantity
+        key = (p.pair, p.group_id if p.group_id is not None else ("seul", p.id))
+        by_group[key] = max(by_group.get(key, Decimal(0)), qty)
+    quantities: dict[str, Decimal] = {}
+    for (pair, _), qty in by_group.items():
+        quantities[pair] = quantities.get(pair, Decimal(0)) + qty
+    return cash, quantities
+
+
+def _opt_str(value: Decimal | None) -> str | None:
+    return None if value is None else str(value)
+
+
+def _opt_dec(raw: str | None) -> Decimal | None:
+    return None if raw is None else Decimal(raw)
+
+
+def _opt_dt(raw: str | None) -> datetime | None:
+    return None if raw is None else datetime.fromisoformat(raw)
+
 
 def _account(row: sqlite3.Row) -> Account:
     return Account(
@@ -174,6 +434,10 @@ def _account(row: sqlite3.Row) -> Account:
         initial_capital=Decimal(row["initial_capital"]),
         cash=Decimal(row["cash"]),
         created_at=datetime.fromisoformat(row["created_at"]),
+        name=row["name"],
+        mode=row["mode"],
+        archived_at=_opt_dt(row["archived_at"]),
+        current=bool(row["active"]),
     )
 
 
@@ -191,4 +455,27 @@ def _order(row: sqlite3.Row) -> Order:
         realized_pnl=Decimal(row["realized_pnl"]),
         source=row["source"],
         created_at=datetime.fromisoformat(row["created_at"]),
+        kind=row["kind"],
+        trigger_price=_opt_dec(row["trigger_price"]),
+        slippage=Decimal(row["slippage"]),
+        pending_id=row["pending_id"],
+    )
+
+
+def _pending(row: sqlite3.Row) -> PendingOrder:
+    return PendingOrder(
+        id=row["id"],
+        account_id=row["account_id"],
+        pair=row["pair"],
+        kind=row["kind"],
+        side=Side(row["side"]),
+        trigger_price=Decimal(row["trigger_price"]),
+        amount=_opt_dec(row["amount"]),
+        quantity=_opt_dec(row["quantity"]),
+        group_id=row["group_id"],
+        status=row["status"],
+        reason=row["reason"],
+        created_at=datetime.fromisoformat(row["created_at"]),
+        closed_at=_opt_dt(row["closed_at"]),
+        order_id=row["order_id"],
     )

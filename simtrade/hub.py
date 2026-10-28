@@ -103,6 +103,8 @@ class PriceHub:
         self._buffer: list[Trade] | None = None  # transactions retenues pendant une resynchro
         self._resync = asyncio.Event()
         self._subscribers: set[asyncio.Queue[Quote]] = set()
+        # Appelés pour CHAQUE cotation, sans file ni perte (déclenchement des ordres en attente).
+        self.listeners: list[Callable[[Quote], object]] = []
 
     @property
     def connected(self) -> bool:
@@ -130,6 +132,11 @@ class PriceHub:
             if queue.full():
                 queue.get_nowait()
             queue.put_nowait(quote)
+        for listener in self.listeners:
+            try:
+                listener(quote)
+            except Exception:  # une erreur d'écouteur ne doit pas couper le flux de prix
+                log.exception("Écouteur de cotations en erreur (%s).", quote.pair)
 
     def update_trade(self, trade: Trade) -> None:
         self.last_trade_at = trade.received_at

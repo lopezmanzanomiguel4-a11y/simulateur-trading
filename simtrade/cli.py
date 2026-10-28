@@ -14,7 +14,21 @@ from simtrade.config import DB_ENV_VAR, db_path
 from simtrade.engine import DEFAULT_CAPITAL, FEE_RATE, validate_capital
 from simtrade.errors import SimTradeError
 from simtrade.feeds import default_feed
-from simtrade.models import PAIRS, Quote, Side, base_asset
+from simtrade.models import (
+    AUTO,
+    LIMIT,
+    MANUAL,
+    MARKET,
+    PAIRS,
+    STOP,
+    TARGET,
+    Account,
+    Order,
+    PendingOrder,
+    Quote,
+    Side,
+    base_asset,
+)
 from simtrade.service import TradeResult, TradingService
 from simtrade.storage import Storage
 
@@ -28,27 +42,68 @@ def build_service() -> TradingService:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="simtrade", description="Simulateur de paper trading crypto (USDT).")
     sub = parser.add_subparsers(dest="command", required=True, metavar="commande")
+    acc = argparse.ArgumentParser(add_help=False)
+    acc.add_argument("--compte", "-c", help="nom ou numéro du compte (défaut : le compte courant)")
 
     p = sub.add_parser("prix", help="prix bid/ask en direct des paires suivies")
     p.add_argument("--once", action="store_true", help="affiche une seule cotation puis quitte")
 
-    p = sub.add_parser("acheter", help="achat au marché (au prix ask)")
+    p = sub.add_parser("acheter", parents=[acc], help="achat au marché (au prix ask)")
     p.add_argument("paire", help="BTCUSDT, ETHUSDT, SOLUSDT (ou btc, eth, sol)")
     p.add_argument("montant", help="montant total en USDT, frais inclus")
 
-    p = sub.add_parser("vendre", help="vente au marché (au prix bid)")
+    p = sub.add_parser("vendre", parents=[acc], help="vente au marché (au prix bid)")
     p.add_argument("paire")
     p.add_argument("quantite", metavar="quantité", help='quantité de crypto, ou "tout"')
 
-    sub.add_parser("portefeuille", help="positions, valeur, P&L et performance")
-    sub.add_parser("historique", help="ordres du compte actif, avec frais")
+    p = sub.add_parser("limite", parents=[acc], help="ordre limite (achat à l'ask <= prix, vente au bid >= prix)")
+    p.add_argument("paire")
+    p.add_argument("sens", choices=[s.value for s in Side])
+    p.add_argument("prix")
+    p.add_argument("taille", help='achat : montant USDT frais inclus ; vente : quantité ou "tout"')
 
-    p = sub.add_parser("reset", help="remet le compte à zéro avec un nouveau capital")
+    for name, label in (("stop", "stop-loss : vente au bid quand bid <= prix"), ("objectif", "take-profit : vente au bid quand bid >= prix")):
+        p = sub.add_parser(name, parents=[acc], help=label)
+        p.add_argument("paire")
+        p.add_argument("prix")
+        p.add_argument("quantite", metavar="quantité", nargs="?", default="tout", help='défaut : "tout"')
+
+    p = sub.add_parser("stop-objectif", parents=[acc], help="stop + objectif liés : le premier exécuté annule l'autre")
+    p.add_argument("paire")
+    p.add_argument("stop")
+    p.add_argument("objectif")
+    p.add_argument("quantite", metavar="quantité", nargs="?", default="tout", help='défaut : "tout"')
+
+    p = sub.add_parser("ordres", parents=[acc], help="ordres en attente du compte")
+    p.add_argument("--tous", action="store_true", help="inclut les ordres exécutés, annulés et rejetés")
+
+    p = sub.add_parser("annuler", parents=[acc], help="annule un ordre en attente (et son ordre lié)")
+    p.add_argument("numero", metavar="n°")
+
+    sub.add_parser("portefeuille", parents=[acc], help="positions, valeur, P&L et performance")
+    sub.add_parser("historique", parents=[acc], help="ordres exécutés du compte, avec frais")
+
+    p = sub.add_parser("reset", parents=[acc], help="remet le compte à zéro avec un nouveau capital")
     p.add_argument("montant", nargs="?", default=str(DEFAULT_CAPITAL), help="capital en USDT (défaut : 10000)")
     p.add_argument("--yes", "-y", action="store_true", help="ne demande pas de confirmation")
 
+    p = sub.add_parser("comptes", help="liste, crée, choisit ou archive des comptes")
+    actions = p.add_subparsers(dest="action", metavar="action")
+    q = actions.add_parser("creer", help="ouvre un compte en parallèle des autres")
+    q.add_argument("nom")
+    q.add_argument("capital", nargs="?", default=str(DEFAULT_CAPITAL))
+    q.add_argument("--auto", action="store_true", help="compte automatique (soumis aux règles de session)")
+    q = actions.add_parser("choisir", help="devient le compte courant")
+    q.add_argument("nom")
+    q = actions.add_parser("archiver", help="archive un compte (ses ordres en attente sont annulés)")
+    q.add_argument("nom")
+
+    p = sub.add_parser("session", help="horaires de session (UTC) des comptes automatiques")
+    p.add_argument("derniere_entree", metavar="dernière_entrée", nargs="?", help="HH:MM (défaut 23:00)")
+    p.add_argument("cloture", metavar="clôture", nargs="?", help="HH:MM (défaut 23:55)")
+
     sub.add_parser("info", help="chemin de la base et comptes enregistrés")
-    sub.add_parser("api", help="lance l'API HTTP sur http://127.0.0.1:8000")
+    sub.add_parser("api", help="lance l'API HTTP sur http://127.0.0.1:8000 (exécute les ordres en attente)")
     return parser
 
 
@@ -86,6 +141,14 @@ def table(headers: Sequence[str], rows: Sequence[Sequence[str]], left: int = 1) 
 
 def local(dt: datetime) -> str:
     return dt.astimezone().strftime("%d/%m/%Y %H:%M:%S")
+
+
+def account_title(a: Account) -> str:
+    return f"Compte n°{a.id} ({a.name}, {a.mode}), ouvert le {local(a.created_at)} avec {fmt.usdt(a.initial_capital)}"
+
+
+def side_label(o: Order) -> str:
+    return o.side.value if o.kind == MARKET else f"{o.side.value} ({o.kind})"
 
 
 def warn_fallback(service: TradingService) -> None:
@@ -163,20 +226,85 @@ def print_quotes(quotes: dict[str, Quote]) -> None:
 
 
 async def cmd_acheter(service: TradingService, args: argparse.Namespace) -> int:
-    print_trade(service, await service.buy(args.paire, args.montant))
+    print_trade(service, await service.buy(args.paire, args.montant, compte=args.compte))
     return 0
 
 
 async def cmd_vendre(service: TradingService, args: argparse.Namespace) -> int:
-    print_trade(service, await service.sell(args.paire, args.quantite))
+    print_trade(service, await service.sell(args.paire, args.quantite, compte=args.compte))
+    return 0
+
+
+# --- Ordres en attente ---
+
+NO_WATCH = "Exécution automatique uniquement pendant que l'API tourne (python -m simtrade api)."
+
+
+def print_pending(orders: Sequence[PendingOrder]) -> None:
+    rows = [
+        (
+            str(o.id),
+            local(o.created_at),
+            o.kind,
+            o.side.value,
+            o.pair,
+            fmt.price(o.trigger_price),
+            fmt.usdt(o.amount) if o.amount is not None else ("tout" if o.quantity is None else fmt.qty(o.quantity)),
+            str(o.group_id) if o.group_id is not None else "",
+            o.status if o.reason is None else f"{o.status} ({o.reason})",
+        )
+        for o in orders
+    ]
+    headers = ["N°", "Posé le", "Type", "Sens", "Paire", "Prix", "Taille", "Lié à", "Statut"]
+    print(table(headers, rows, left=5))
+
+
+async def cmd_limite(service: TradingService, args: argparse.Namespace) -> int:
+    order = await service.place_order(args.paire, LIMIT, args.sens, args.prix, args.taille, compte=args.compte)
+    print("Ordre limite posé :")
+    print_pending([order])
+    print(NO_WATCH)
+    return 0
+
+
+async def cmd_stop(service: TradingService, args: argparse.Namespace) -> int:
+    kind = STOP if args.command == "stop" else TARGET
+    order = await service.place_order(args.paire, kind, Side.SELL, args.prix, args.quantite, compte=args.compte)
+    print(f"Ordre {kind} posé :")
+    print_pending([order])
+    print(NO_WATCH)
+    return 0
+
+
+async def cmd_stop_objectif(service: TradingService, args: argparse.Namespace) -> int:
+    orders = await service.place_bracket(args.paire, args.stop, args.objectif, args.quantite, compte=args.compte)
+    print("Stop et objectif liés posés (le premier exécuté annule l'autre) :")
+    print_pending(orders)
+    print(NO_WATCH)
+    return 0
+
+
+def cmd_ordres(service: TradingService, args: argparse.Namespace) -> int:
+    account = service.account(args.compte)
+    orders = service.pending_orders(compte=args.compte, all_statuses=args.tous)
+    print(account_title(account))
+    if not orders:
+        print("Aucun ordre en attente." if not args.tous else "Aucun ordre en attente, ni passé.")
+        return 0
+    print_pending(orders)
+    return 0
+
+
+def cmd_annuler(service: TradingService, args: argparse.Namespace) -> int:
+    cancelled = service.cancel_order(args.numero, compte=args.compte)
+    print("Annulé : " + ", ".join(f"ordre n°{o.id} ({o.kind} {o.pair})" for o in cancelled) + ".")
     return 0
 
 
 async def cmd_portefeuille(service: TradingService, args: argparse.Namespace) -> int:
-    v = await service.valuation()
+    v = await service.valuation(compte=args.compte)
     warn_fallback(service)
-    a = v.account
-    print(f"Compte n°{a.id}, ouvert le {local(a.created_at)} avec {fmt.usdt(a.initial_capital)}")
+    print(account_title(v.account))
     print()
     if v.positions:
         rows = [
@@ -213,8 +341,8 @@ async def cmd_portefeuille(service: TradingService, args: argparse.Namespace) ->
 
 
 def cmd_historique(service: TradingService, args: argparse.Namespace) -> int:
-    account, orders = service.history()
-    print(f"Compte n°{account.id}, ouvert le {local(account.created_at)} avec {fmt.usdt(account.initial_capital)}")
+    account, orders = service.history(compte=args.compte)
+    print(account_title(account))
     if not orders:
         print("Aucun ordre sur ce compte.")
         return 0
@@ -222,7 +350,7 @@ def cmd_historique(service: TradingService, args: argparse.Namespace) -> int:
         (
             str(o.id),
             local(o.created_at),
-            o.side.value,
+            side_label(o),
             o.pair,
             fmt.qty(o.quantity),
             fmt.price(o.price),
@@ -238,14 +366,25 @@ def cmd_historique(service: TradingService, args: argparse.Namespace) -> int:
     print(table(headers, rows, left=4))
     total_fees = sum(o.fee for o in orders)
     print(f"\n{len(orders)} ordre(s), frais totaux : {fmt.usdt(total_fees, 4)}")
+    slipped = [o for o in orders if o.trigger_price is not None]
+    if slipped:
+        total = sum(o.slippage for o in slipped)
+        print(
+            f"Glissement des ordres en attente exécutés : {fmt.usdt(total, 4, sign=True)} "
+            "(positif = coût, prix exécuté moins bon que le prix de déclenchement)"
+        )
     return 0
 
 
 def cmd_reset(service: TradingService, args: argparse.Namespace) -> int:
     capital = validate_capital(args.montant)  # refuse avant de demander confirmation
+    target = service.account(args.compte)
     if not args.yes:
-        print(f"Remettre le compte à zéro avec {fmt.usdt(capital)} ?")
-        print("Les positions ouvertes seront abandonnées (pas vendues). L'ancien compte reste archivé dans la base.")
+        print(f"Remettre le compte '{target.name}' (n°{target.id}) à zéro avec {fmt.usdt(capital)} ?")
+        print(
+            "Les positions ouvertes seront abandonnées (pas vendues) et les ordres en attente annulés. "
+            "L'ancien compte reste archivé dans la base."
+        )
         try:
             answer = input("Confirmer ? (o/N) ").strip().lower()
         except EOFError:
@@ -253,18 +392,63 @@ def cmd_reset(service: TradingService, args: argparse.Namespace) -> int:
         if answer not in ("o", "oui", "y", "yes"):
             print("Annulé, rien n'a changé.")
             return 0
-    account = service.reset(capital)
+    account = service.reset(capital, compte=args.compte)
     print(f"Compte n°{account.id} ouvert le {local(account.created_at)} avec {fmt.usdt(account.initial_capital)}.")
+    return 0
+
+
+def cmd_comptes(service: TradingService, args: argparse.Namespace) -> int:
+    if args.action == "creer":
+        a = service.create_account(args.nom, args.capital, AUTO if args.auto else MANUAL)
+        print(f"Compte '{a.name}' (n°{a.id}, {a.mode}) ouvert avec {fmt.usdt(a.initial_capital)}.")
+        return 0
+    if args.action == "choisir":
+        a = service.select_account(args.nom)
+        print(f"Compte courant : '{a.name}' (n°{a.id}).")
+        return 0
+    if args.action == "archiver":
+        a = service.archive_account(args.nom)
+        print(f"Compte '{a.name}' (n°{a.id}) archivé, ses ordres en attente sont annulés.")
+        return 0
+    rows = [
+        (
+            ("* " if a.current else "  ") + a.name,
+            str(a.id),
+            a.mode,
+            fmt.usdt(a.initial_capital),
+            fmt.usdt(a.cash),
+            local(a.created_at),
+        )
+        for a in service.open_accounts()
+    ]
+    print(table(["Nom", "N°", "Mode", "Capital initial", "Solde USDT", "Ouvert le"], rows, left=3))
+    print("* compte courant (utilisé sans --compte)")
+    return 0
+
+
+def cmd_session(service: TradingService, args: argparse.Namespace) -> int:
+    if args.derniere_entree is not None or args.cloture is not None:
+        if args.derniere_entree is None or args.cloture is None:
+            print("Erreur : donne les deux heures (dernière entrée et clôture), ex. : session 22:00 23:50", file=sys.stderr)
+            return 1
+        rules = service.set_session_rules(args.derniere_entree, args.cloture)
+        print("Horaires de session enregistrés.")
+    else:
+        rules = service.session_rules()
+    print(f"Comptes automatiques : plus d'entrée à partir de {rules.last_entry:%H:%M} UTC, clôture forcée à {rules.close:%H:%M} UTC.")
     return 0
 
 
 def cmd_info(service: TradingService, args: argparse.Namespace) -> int:
     active = service.account()
-    accounts = service.accounts()
+    archived = sum(1 for a in service.accounts() if a.archived)
+    rules = service.session_rules()
     print(f"Base SQLite : {service.storage.path}")
     print(f"(modifiable avec la variable d'environnement {DB_ENV_VAR})")
-    print(f"Compte actif : n°{active.id}, {fmt.usdt(active.initial_capital)} au {local(active.created_at)}")
-    print(f"Comptes archivés : {len(accounts) - 1}")
+    print(f"Compte courant : '{active.name}' n°{active.id}, {fmt.usdt(active.initial_capital)} au {local(active.created_at)}")
+    print(f"Comptes ouverts : {', '.join(a.name for a in service.open_accounts())}")
+    print(f"Comptes archivés : {archived}")
+    print(f"Session (UTC) : dernière entrée {rules.last_entry:%H:%M}, clôture {rules.close:%H:%M}")
     return 0
 
 
@@ -281,6 +465,14 @@ COMMANDS = {
     "vendre": cmd_vendre,
     "portefeuille": cmd_portefeuille,
     "historique": cmd_historique,
+    "limite": cmd_limite,
+    "stop": cmd_stop,
+    "objectif": cmd_stop,
+    "stop-objectif": cmd_stop_objectif,
+    "ordres": cmd_ordres,
+    "annuler": cmd_annuler,
     "reset": cmd_reset,
+    "comptes": cmd_comptes,
+    "session": cmd_session,
     "info": cmd_info,
 }

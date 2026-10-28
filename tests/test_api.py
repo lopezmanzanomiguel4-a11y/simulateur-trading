@@ -429,3 +429,82 @@ def test_info_flux_volume_historique_et_horloge(client):
     assert set(vol) == {"actif", "connecte", "derniere_transaction", "derniere_erreur", "reconnexions", "source", "repli"}
     assert info["historique"]["etat"] == "desactive"  # feed fourni sans historique : rien à télécharger
     assert info["horloge"] == {"ecart_ms": None, "aller_retour_ms": None, "mesure_le": None, "erreur": None}
+
+
+# --- Étape 4 : ordres en attente, comptes, session ---
+
+
+def push_quote(client, pair, bid, ask=None):
+    """Cotation live injectée dans la boucle de l'API (le watcher utilise la connexion SQLite de ce thread)."""
+    quote = Quote(pair, D(bid), D(ask or bid), "Simulé", utcnow())
+    client.portal.call(client.app.state.hub.update, quote)
+
+
+def test_stop_pose_puis_execute_par_le_flux(client):
+    buy(client, "btc", "8000")
+    r = client.post("/ordres/stop", json={"paire": "btc", "prix": "79000"})
+    assert r.status_code == 200
+    (stop,) = r.json()["ordres"]
+    assert (stop["type_ordre"], stop["sens"], stop["quantite"], stop["statut"]) == ("stop", "vente", "tout", "en_attente")
+    assert [o["id"] for o in client.get("/ordres/attente").json()["ordres"]] == [stop["id"]]
+
+    push_quote(client, "BTCUSDT", "78500", "78501")  # le prix saute sous le stop
+
+    last = client.get("/historique").json()["ordres"][-1]
+    assert (last["type_ordre"], last["prix"], last["prix_declenchement"]) == ("stop", "78500", "79000")
+    assert D(last["glissement"]) == (D("500") * D(last["quantite"])).quantize(D("0.00000001")) > 0  # (79000 - 78500) x q
+    assert last["ordre_attente_id"] == stop["id"]
+    assert client.get("/ordres/attente").json()["ordres"] == []
+    tous = client.get("/ordres/attente", params={"tous": "true"}).json()["ordres"]
+    assert tous[0]["statut"] == "execute" and tous[0]["ordre_execute_id"] == last["id"]
+
+
+def test_stop_objectif_et_annulation(client):
+    buy(client, "eth", "1000")
+    r = client.post("/ordres/stop-objectif", json={"paire": "eth", "stop": "2300", "objectif": "2500"})
+    stop, target = r.json()["ordres"]
+    assert stop["lie_a"] == target["lie_a"] == stop["id"]
+    r = client.delete(f"/ordres/{target['id']}")
+    assert r.status_code == 200 and {o["id"] for o in r.json()["annules"]} == {stop["id"], target["id"]}
+    r = client.delete(f"/ordres/{target['id']}")
+    assert r.status_code == 400 and "n'est plus en attente" in r.json()["erreur"]
+
+
+def test_ordre_limite_et_refus(client):
+    r = client.post("/ordres/limite", json={"paire": "sol", "sens": "achat", "prix": "99", "montant": "500"})
+    assert r.status_code == 200 and r.json()["ordres"][0]["montant"] == "500"
+    r = client.post("/ordres/limite", json={"paire": "sol", "sens": "achat", "prix": "99"})
+    assert r.status_code == 400 and "montant" in r.json()["erreur"]
+    r = client.post("/ordres/stop", json={"paire": "btc", "prix": "79000"})
+    assert r.status_code == 400 and r.json()["erreur"] == "Aucune position sur BTCUSDT : rien à vendre."
+    buy(client, "btc", "1000")
+    r = client.post("/ordres/stop", json={"paire": "btc", "prix": "81000"})  # au-dessus du bid
+    assert r.status_code == 400 and "exécuté immédiatement" in r.json()["erreur"]
+
+
+def test_comptes_en_parallele_via_api(client):
+    r = client.post("/comptes", json={"nom": "robot", "capital": "2000", "mode": "auto"})
+    assert r.status_code == 200 and r.json()["compte"]["mode"] == "auto"
+    assert [c["nom"] for c in client.get("/comptes").json()["comptes"]] == ["principal", "robot"]
+
+    r = client.post("/ordres/achat", params={"compte": "robot"}, json={"paire": "sol", "montant": "500"})
+    assert r.status_code == 200
+    assert client.get("/portefeuille", params={"compte": "robot"}).json()["positions"][0]["paire"] == "SOLUSDT"
+    assert client.get("/portefeuille").json()["positions"] == []  # compte courant intact
+    assert client.get("/historique", params={"compte": "robot"}).json()["compte"]["nom"] == "robot"
+
+    r = client.post("/comptes/robot/archiver")
+    assert r.status_code == 200 and r.json()["compte"]["archive_le"]
+    r = client.get("/portefeuille", params={"compte": "robot"})
+    assert r.status_code == 400 and "inconnu" in r.json()["erreur"]
+    info = client.get("/info").json()
+    assert info["comptes_ouverts"] == ["principal"] and info["comptes_archives"] == 1
+
+
+def test_session_lecture_et_reglage(client):
+    assert client.get("/session").json() == {"derniere_entree": "23:00", "cloture": "23:55", "fuseau": "UTC"}
+    r = client.put("/session", json={"derniere_entree": "23:58", "cloture": "23:50"})
+    assert r.status_code == 400 and "dernière entrée" in r.json()["erreur"]
+    r = client.put("/session", json={"derniere_entree": "22:00", "cloture": "23:30"})
+    assert r.status_code == 200 and r.json()["cloture"] == "23:30"
+    assert client.get("/info").json()["session"]["derniere_entree"] == "22:00"

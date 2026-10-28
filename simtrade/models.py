@@ -81,12 +81,34 @@ class Position:
         return self.cost_basis / self.quantity
 
 
+MANUAL = "manuel"
+AUTO = "auto"
+MODES: tuple[str, ...] = (MANUAL, AUTO)
+
+
 @dataclass
 class Account:
     id: int | None
     initial_capital: Decimal
     cash: Decimal
     created_at: datetime  # date de création ou du dernier reset
+    name: str = "principal"
+    mode: str = MANUAL  # un compte auto est soumis aux règles de session, un compte manuel jamais
+    archived_at: datetime | None = None  # None : compte ouvert
+    current: bool = True  # compte utilisé quand aucun n'est précisé
+
+    @property
+    def archived(self) -> bool:
+        return self.archived_at is not None
+
+
+# Types d'ordre exécuté (Order.kind)
+MARKET = "marche"
+LIMIT = "limite"
+STOP = "stop"
+TARGET = "objectif"
+SESSION_CLOSE = "cloture_session"
+LATE_SESSION_CLOSE = "cloture_tardive"
 
 
 @dataclass(frozen=True)
@@ -102,4 +124,35 @@ class Order:
     realized_pnl: Decimal  # nul pour un achat
     source: str
     created_at: datetime
+    id: int | None = None
+    kind: str = MARKET
+    trigger_price: Decimal | None = None  # ordres en attente : limite, stop ou objectif
+    slippage: Decimal = Decimal(0)  # en USDT ; positif = coût (stop sauté), négatif = amélioration
+    pending_id: int | None = None
+
+
+# Statuts d'un ordre en attente
+PENDING = "en_attente"
+FILLED = "execute"
+CANCELLED = "annule"
+REJECTED = "rejete"
+
+
+@dataclass(frozen=True)
+class PendingOrder:
+    """Ordre limite, stop ou objectif, exécuté quand le flux live touche son prix."""
+
+    account_id: int
+    pair: str
+    kind: str  # LIMIT, STOP ou TARGET
+    side: Side
+    trigger_price: Decimal
+    amount: Decimal | None  # achat : montant USDT total, frais inclus
+    quantity: Decimal | None  # vente : quantité ; None = toute la position au déclenchement
+    created_at: datetime
+    group_id: int | None = None  # paire stop + objectif : l'un annule l'autre
+    status: str = PENDING
+    reason: str | None = None
+    closed_at: datetime | None = None
+    order_id: int | None = None
     id: int | None = None

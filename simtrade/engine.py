@@ -95,6 +95,18 @@ class Portfolio:
     realized_pnl: Decimal = Decimal(0)
     fees_paid: Decimal = Decimal(0)
     fee_rate: Decimal = FEE_RATE
+    # Bloqués par les ordres en attente : USDT des achats limites, quantités des ventes par paire.
+    reserved_cash: Decimal = Decimal(0)
+    reserved_qty: dict[str, Decimal] = field(default_factory=dict)
+
+    @property
+    def free_cash(self) -> Decimal:
+        return self.account.cash - self.reserved_cash
+
+    def free_quantity(self, pair: str) -> Decimal:
+        position = self.positions.get(pair)
+        held = position.quantity if position else Decimal(0)
+        return max(held - self.reserved_qty.get(pair, Decimal(0)), Decimal(0))
 
     # --- Vérifications sans prix (permettent de refuser avant d'interroger le réseau) ---
 
@@ -102,9 +114,12 @@ class Portfolio:
         amount = parse_decimal(amount_usdt, "Montant")
         if amount <= 0:
             raise OrderRejected(f"Le montant d'achat doit être strictement positif (reçu : {amount_usdt}).")
-        if amount > self.account.cash:
+        if amount > self.free_cash:
+            reserved = (
+                f" ({fmt.usdt(self.reserved_cash)} réservés par des ordres en attente)" if self.reserved_cash else ""
+            )
             raise OrderRejected(
-                f"Solde insuffisant : {fmt.usdt(amount)} demandés, {fmt.usdt(self.account.cash)} disponibles."
+                f"Solde insuffisant : {fmt.usdt(amount)} demandés, {fmt.usdt(self.free_cash)} disponibles{reserved}."
             )
         return amount
 
@@ -112,18 +127,25 @@ class Portfolio:
         position = self.positions.get(pair)
         if position is None or position.quantity <= 0:
             raise OrderRejected(f"Aucune position sur {pair} : rien à vendre.")
+        free = self.free_quantity(pair)
+        reserved = position.quantity - free
+        if free <= 0:
+            raise OrderRejected(
+                f"Toute la position {pair} est réservée par des ordres en attente : annule-les d'abord."
+            )
         if str(quantity).strip().lower() == "tout":
-            return position, position.quantity
+            return position, free
         qty = parse_decimal(quantity, "Quantité")
         if qty <= 0:
             raise OrderRejected(f"La quantité à vendre doit être strictement positive (reçu : {quantity}).")
         qty = qty.quantize(QTY_STEP, rounding=ROUND_DOWN)
         if qty <= 0:
             raise OrderRejected(f"Quantité trop faible : minimum {QTY_STEP} {base_asset(pair)}.")
-        if qty > position.quantity:
+        if qty > free:
+            detail = f", dont {fmt.qty(reserved)} réservés par des ordres en attente" if reserved else ""
             raise OrderRejected(
                 f"Quantité insuffisante : tu veux vendre {fmt.qty(qty)} {base_asset(pair)}, "
-                f"tu en détiens {fmt.qty(position.quantity)}."
+                f"tu en détiens {fmt.qty(position.quantity)}{detail}."
             )
         return position, qty
 

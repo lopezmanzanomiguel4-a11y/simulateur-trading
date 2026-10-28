@@ -25,9 +25,11 @@ from simtrade.engine import DEFAULT_CAPITAL, normalize_pair
 from simtrade.errors import FeedUnavailable, InvalidCapital, InvalidInput, OrderRejected, SimTradeError
 from simtrade.feeds.base import PriceFeed
 from simtrade.hub import CachedFeed, PriceHub
-from simtrade.models import Account, Order, Quote
+from simtrade.models import LIMIT, MANUAL, STOP, TARGET, Account, Order, PendingOrder, Quote, Side
 from simtrade.service import TradeResult, TradingService
+from simtrade.sessions import SessionRules
 from simtrade.storage import Storage
+from simtrade.watcher import OrderWatcher, SessionScheduler
 
 HOST = "127.0.0.1"
 PORT = 8000
@@ -58,6 +60,38 @@ class ResetBody(BaseModel):
     capital: str = str(DEFAULT_CAPITAL)
 
 
+class LimitBody(BaseModel):
+    paire: str
+    sens: str  # achat ou vente
+    prix: str
+    montant: str | None = None  # achat : montant USDT total, frais inclus
+    quantite: str | None = None  # vente : quantité ou "tout"
+
+
+class StopBody(BaseModel):
+    paire: str
+    prix: str
+    quantite: str = "tout"
+
+
+class BracketBody(BaseModel):
+    paire: str
+    stop: str
+    objectif: str
+    quantite: str = "tout"
+
+
+class AccountBody(BaseModel):
+    nom: str
+    capital: str = str(DEFAULT_CAPITAL)
+    mode: str = MANUAL
+
+
+class SessionBody(BaseModel):
+    derniere_entree: str
+    cloture: str
+
+
 # --- Sérialisation ---
 
 
@@ -86,9 +120,13 @@ def quote_json(quote: Quote, feed: CachedFeed) -> dict:
 def account_json(account: Account) -> dict:
     return {
         "id": account.id,
+        "nom": account.name,
+        "mode": account.mode,
+        "courant": account.current,
         "capital_initial": dec(account.initial_capital),
         "solde": dec(account.cash),
         "cree_le": iso(account.created_at),
+        "archive_le": opt_iso(account.archived_at),
     }
 
 
@@ -97,6 +135,7 @@ def order_json(order: Order) -> dict:
         "id": order.id,
         "date": iso(order.created_at),
         "type": order.side.value,
+        "type_ordre": order.kind,
         "paire": order.pair,
         "quantite": dec(order.quantity),
         "prix": dec(order.price),
@@ -104,8 +143,34 @@ def order_json(order: Order) -> dict:
         "frais": dec(order.fee),
         "flux_usdt": dec(order.cash_flow),
         "pnl_realise": dec(order.realized_pnl),
+        "prix_declenchement": opt(order.trigger_price),
+        "glissement": dec(order.slippage),
+        "ordre_attente_id": order.pending_id,
         "source": order.source,
     }
+
+
+def pending_json(order: PendingOrder) -> dict:
+    return {
+        "id": order.id,
+        "compte_id": order.account_id,
+        "paire": order.pair,
+        "type_ordre": order.kind,
+        "sens": order.side.value,
+        "prix_declenchement": dec(order.trigger_price),
+        "montant": opt(order.amount),
+        "quantite": "tout" if order.side is Side.SELL and order.quantity is None else opt(order.quantity),
+        "lie_a": order.group_id,
+        "statut": order.status,
+        "raison": order.reason,
+        "cree_le": iso(order.created_at),
+        "clos_le": opt_iso(order.closed_at),
+        "ordre_execute_id": order.order_id,
+    }
+
+
+def rules_json(rules: SessionRules) -> dict:
+    return {"derniere_entree": f"{rules.last_entry:%H:%M}", "cloture": f"{rules.close:%H:%M}", "fuseau": "UTC"}
 
 
 def trade_json(result: TradeResult) -> dict:
@@ -196,16 +261,24 @@ def create_app(service: ServiceFactory | None = None, hub: PriceHub | None = Non
         price_hub = hub or PriceHub()
         feed = CachedFeed(price_hub)
         svc = make_service(feed)
-        task = asyncio.create_task(price_hub.run())
+        watcher = OrderWatcher(svc)
+        watcher.load()  # ordres en attente enregistrés avant l'arrêt
+        price_hub.listeners.append(watcher.on_quote)
+        scheduler = SessionScheduler(svc, watcher)
+        tasks = [asyncio.create_task(price_hub.run()), asyncio.create_task(scheduler.run())]
         app.state.hub, app.state.feed, app.state.service = price_hub, feed, svc
+        app.state.watcher, app.state.scheduler = watcher, scheduler
         try:
             yield
         finally:
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
+            for task in tasks:
+                task.cancel()
+            for task in tasks:
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+            price_hub.listeners.remove(watcher.on_quote)
             svc.storage.close()
             await price_hub.aclose()
 
@@ -246,16 +319,86 @@ def create_app(service: ServiceFactory | None = None, hub: PriceHub | None = Non
         return {"cotations": [quote_json(q, feed) for q in quotes]}
 
     @app.post("/ordres/achat")
-    async def achat(body: BuyBody, request: Request) -> dict:
-        return trade_json(await svc_of(request).buy(body.paire, body.montant))
+    async def achat(body: BuyBody, request: Request, compte: str | None = None) -> dict:
+        return trade_json(await svc_of(request).buy(body.paire, body.montant, compte=compte))
 
     @app.post("/ordres/vente")
-    async def vente(body: SellBody, request: Request) -> dict:
-        return trade_json(await svc_of(request).sell(body.paire, body.quantite))
+    async def vente(body: SellBody, request: Request, compte: str | None = None) -> dict:
+        return trade_json(await svc_of(request).sell(body.paire, body.quantite, compte=compte))
+
+    # --- Ordres en attente ---
+
+    @app.get("/ordres/attente")
+    async def ordres_attente(request: Request, compte: str | None = None, tous: bool = False) -> dict:
+        svc = svc_of(request)
+        orders = svc.pending_orders(compte=compte, all_statuses=tous)
+        return {"compte": account_json(svc.account(compte)), "ordres": [pending_json(o) for o in orders]}
+
+    @app.post("/ordres/limite")
+    async def ordre_limite(body: LimitBody, request: Request, compte: str | None = None) -> dict:
+        size = body.montant if body.sens.strip().lower() == Side.BUY.value else body.quantite
+        if size is None:
+            champ = "montant" if body.sens.strip().lower() == Side.BUY.value else "quantite"
+            raise InvalidInput(f"Champ '{champ}' manquant pour un ordre limite de {body.sens}.")
+        order = await svc_of(request).place_order(body.paire, LIMIT, body.sens, body.prix, size, compte=compte)
+        return {"ordres": [pending_json(order)]}
+
+    @app.post("/ordres/stop")
+    async def ordre_stop(body: StopBody, request: Request, compte: str | None = None) -> dict:
+        order = await svc_of(request).place_order(body.paire, STOP, Side.SELL, body.prix, body.quantite, compte=compte)
+        return {"ordres": [pending_json(order)]}
+
+    @app.post("/ordres/objectif")
+    async def ordre_objectif(body: StopBody, request: Request, compte: str | None = None) -> dict:
+        order = await svc_of(request).place_order(
+            body.paire, TARGET, Side.SELL, body.prix, body.quantite, compte=compte
+        )
+        return {"ordres": [pending_json(order)]}
+
+    @app.post("/ordres/stop-objectif")
+    async def ordre_stop_objectif(body: BracketBody, request: Request, compte: str | None = None) -> dict:
+        orders = await svc_of(request).place_bracket(
+            body.paire, body.stop, body.objectif, body.quantite, compte=compte
+        )
+        return {"ordres": [pending_json(o) for o in orders]}
+
+    @app.delete("/ordres/{numero}")
+    async def annuler(numero: str, request: Request, compte: str | None = None) -> dict:
+        return {"annules": [pending_json(o) for o in svc_of(request).cancel_order(numero, compte=compte)]}
+
+    # --- Comptes ---
+
+    @app.get("/comptes")
+    async def comptes(request: Request, archives: bool = False) -> dict:
+        svc = svc_of(request)
+        accounts = svc.accounts() if archives else svc.open_accounts()
+        return {"comptes": [account_json(a) for a in accounts]}
+
+    @app.post("/comptes")
+    async def creer_compte(body: AccountBody, request: Request) -> dict:
+        return {"compte": account_json(svc_of(request).create_account(body.nom, body.capital, body.mode))}
+
+    @app.post("/comptes/{nom}/choisir")
+    async def choisir_compte(nom: str, request: Request) -> dict:
+        return {"compte": account_json(svc_of(request).select_account(nom))}
+
+    @app.post("/comptes/{nom}/archiver")
+    async def archiver_compte(nom: str, request: Request) -> dict:
+        return {"compte": account_json(svc_of(request).archive_account(nom))}
+
+    # --- Session ---
+
+    @app.get("/session")
+    async def session(request: Request) -> dict:
+        return rules_json(svc_of(request).session_rules())
+
+    @app.put("/session")
+    async def regler_session(body: SessionBody, request: Request) -> dict:
+        return rules_json(svc_of(request).set_session_rules(body.derniere_entree, body.cloture))
 
     @app.get("/portefeuille")
-    async def portefeuille(request: Request) -> dict:
-        v = await svc_of(request).valuation()
+    async def portefeuille(request: Request, compte: str | None = None) -> dict:
+        v = await svc_of(request).valuation(compte=compte)
         return {
             "compte": account_json(v.account),
             "positions": [
@@ -280,13 +423,13 @@ def create_app(service: ServiceFactory | None = None, hub: PriceHub | None = Non
         }
 
     @app.get("/historique")
-    async def historique(request: Request) -> dict:
-        account, orders = svc_of(request).history()
+    async def historique(request: Request, compte: str | None = None) -> dict:
+        account, orders = svc_of(request).history(compte=compte)
         return {"compte": account_json(account), "ordres": [order_json(o) for o in orders]}
 
     @app.post("/reset")
-    async def reset(request: Request, body: ResetBody | None = None) -> dict:
-        account = svc_of(request).reset((body or ResetBody()).capital)
+    async def reset(request: Request, body: ResetBody | None = None, compte: str | None = None) -> dict:
+        account = svc_of(request).reset((body or ResetBody()).capital, compte=compte)
         return {"compte": account_json(account)}
 
     @app.get("/info")
@@ -296,7 +439,9 @@ def create_app(service: ServiceFactory | None = None, hub: PriceHub | None = Non
         return {
             "base": svc.storage.path,
             "compte_actif": account_json(svc.account()),
-            "comptes_archives": len(svc.accounts()) - 1,
+            "comptes_ouverts": [a.name for a in svc.open_accounts()],
+            "comptes_archives": sum(1 for a in svc.accounts() if a.archived),
+            "session": rules_json(svc.session_rules()),
             "flux": {
                 "source": h.source or h.feed.name,
                 "connecte": h.connected,

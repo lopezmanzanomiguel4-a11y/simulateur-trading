@@ -1,7 +1,7 @@
 # Simulateur de paper trading crypto
 
 Simulateur d'achat/vente de cryptomonnaies **avec de l'argent fictif** et des **prix réels**, en ligne de commande ou via une API HTTP locale.
-Étapes 1 à 3 d'un projet qui recevra plus tard une interface.
+Étapes 1 à 4 d'un projet qui recevra plus tard une interface.
 
 ## Ce que ça fait
 
@@ -14,6 +14,9 @@ Simulateur d'achat/vente de cryptomonnaies **avec de l'argent fictif** et des **
 - **Capital de départ paramétrable** (10 000 USDT par défaut, maximum 10 000 000).
 - **Persistance SQLite** : le portefeuille survit à un redémarrage.
 - **Calculs de marché** (API) : bougies OHLC 1m, 5m, 15m et 1h préchargées depuis l'historique Binance puis construites en direct sur les transactions, SMA, EMA, RSI, VWAP de session et variation, avec des signaux de qualité des données.
+- **Ordres en attente** : achat ou vente limite, stop-loss, take-profit (objectif) et paire stop + objectif liée (l'un annule l'autre), exécutés par le flux live de l'API, avec le glissement enregistré quand le prix saute le stop.
+- **Comptes multiples** ouverts en parallèle, chacun avec son capital, en mode **manuel** ou **automatique**.
+- **Sessions intraday** pour les comptes automatiques : plus d'entrée après 23:00 UTC, clôture forcée de toutes les positions à 23:55 UTC (horaires paramétrables), avec rattrapage si l'API était arrêtée.
 
 ## Installation (Windows / PowerShell)
 
@@ -40,8 +43,32 @@ python -m simtrade historique           # tous les ordres du compte actif, avec 
 python -m simtrade reset                # nouveau compte à 10 000 USDT (demande confirmation)
 python -m simtrade reset 2500           # nouveau compte à 2 500 USDT
 python -m simtrade reset 2500 --yes     # sans confirmation
-python -m simtrade info                 # chemin de la base, compte actif
+python -m simtrade info                 # chemin de la base, comptes, horaires de session
 python -m simtrade api                  # lance l'API sur http://127.0.0.1:8000 (voir plus bas)
+```
+
+Ordres en attente (exécutés **uniquement pendant que l'API tourne**, voir Limites) :
+
+```powershell
+python -m simtrade limite btc achat 78000 500       # achète pour 500 USDT quand l'ask <= 78 000
+python -m simtrade limite eth vente 2600 0.1        # vend 0,1 ETH quand le bid >= 2 600
+python -m simtrade stop btc 76000                   # stop-loss sur toute la position (quantité facultative)
+python -m simtrade objectif btc 85000 0.002         # take-profit sur 0,002 BTC
+python -m simtrade stop-objectif sol 90 120         # stop + objectif liés : le premier exécuté annule l'autre
+python -m simtrade ordres                           # ordres en attente du compte (--tous : aussi exécutés/annulés)
+python -m simtrade annuler 3                        # annule l'ordre n°3 (et son ordre lié)
+```
+
+Comptes et sessions :
+
+```powershell
+python -m simtrade comptes                          # comptes ouverts, * = compte courant
+python -m simtrade comptes creer robot 2000 --auto  # nouveau compte automatique de 2 000 USDT
+python -m simtrade comptes choisir robot            # devient le compte courant
+python -m simtrade comptes archiver robot           # archive (ordres en attente annulés)
+python -m simtrade acheter btc 100 --compte robot   # --compte (ou -c) sur acheter, vendre, ordres, portefeuille, historique, reset...
+python -m simtrade session                          # horaires de session (UTC)
+python -m simtrade session 22:00 23:50              # dernière entrée 22:00, clôture 23:50
 ```
 
 Les paires s'écrivent `BTCUSDT`, `btc`, `BTC/USDT` ou `btc-usdt`. Les nombres acceptent le point ou la virgule (`0,05`).
@@ -61,9 +88,39 @@ Notations : $f = 0{,}001$ (taux de frais), $q$ la quantité, $C$ le prix de revi
 
 Juste après un achat, la performance est donc légèrement négative : c'est le coût du spread et des frais.
 
+### Ordres en attente
+
+| Ordre | Déclenché quand | Exécuté à |
+|---|---|---|
+| Achat limite (montant USDT, frais inclus) | $\text{ask} \le$ limite | l'ask de la cotation qui déclenche |
+| Vente limite, objectif | $\text{bid} \ge$ prix | le bid de la cotation qui déclenche |
+| Stop | $\text{bid} \le$ stop | le bid disponible, **même s'il a sauté sous le stop** |
+
+Positions longues uniquement : pas de vente à découvert, pas de stop d'achat. Un ordre qui partirait immédiatement à la pose est refusé (passer un ordre au marché). Les ordres manuels restent valables jusqu'à annulation.
+
+**Glissement** enregistré sur chaque ordre exécuté depuis une attente, avec $p_d$ le prix de déclenchement, $p_e$ le prix d'exécution et $q$ la quantité :
+
+$$g_{\text{vente}} = (p_d - p_e)\, q \qquad g_{\text{achat}} = (p_e - p_d)\, q$$
+
+$g > 0$ est un coût (stop sauté), $g < 0$ une amélioration (limite exécutée à un meilleur prix).
+
+**Réservations** : un achat limite bloque son montant, une vente en attente bloque sa quantité (une paire stop + objectif compte une fois). Un ordre au marché ne peut utiliser que la part libre ; `tout` sur un stop ou un objectif désigne toute la position au moment du déclenchement et suppose qu'aucune partie n'est déjà réservée. Au déclenchement, une vente est plafonnée à la quantité détenue ; sans position, l'ordre est annulé.
+
+### Comptes, mode manuel ou automatique, sessions
+
+Plusieurs comptes peuvent être ouverts en même temps, chacun avec son capital. Le **compte courant** est celui utilisé sans `--compte` (CLI) ni `?compte=` (API). Un compte est **manuel** ou **automatique** à sa création, sans mélange : tout ordre passé sur un compte automatique, par n'importe quelle interface, suit les règles de session ; un compte manuel ne les suit jamais.
+
+Règles de session des comptes automatiques (horaires communs à tous les comptes, en UTC, modifiables avec `session` ou `PUT /session`) :
+- session = journée UTC ; aucun achat (au marché ou limite, à la pose comme au déclenchement) à partir de la **dernière entrée** (23:00 par défaut) ; les ventes restent permises ;
+- à la **clôture** (23:55 par défaut), l'API annule les ordres en attente du compte puis vend toutes ses positions au bid (ordres de type `cloture_session`) ;
+- si la cotation a plus de 5 s, la clôture est reportée à la première cotation fraîche (vérification chaque seconde) ;
+- **rattrapage** : si l'API était arrêtée à l'heure de clôture, les positions de la session passée sont vendues à la première cotation fraîche après le redémarrage, au prix du moment. Une clôture faite plus de 5 s après l'heure prévue est de type `cloture_tardive`.
+
 ### Reset et base de données
 
-`reset` n'efface rien : il **archive** le compte actif (avec ses ordres) et ouvre un compte neuf avec le capital choisi et la date du reset. Les positions ouvertes sont abandonnées, pas vendues. `historique` et `portefeuille` ne montrent que le compte actif.
+`reset` n'efface rien : il **archive** le compte (le compte courant, ou celui donné avec `--compte`) avec ses ordres et ouvre un compte neuf de même nom et de même mode, avec le capital choisi et la date du reset. Les positions ouvertes sont abandonnées, pas vendues, et les ordres en attente annulés. `historique` et `portefeuille` ne montrent qu'un compte à la fois.
+
+**Migration** : la base des étapes 1 à 3 est mise à niveau automatiquement à la première ouverture. Elle est d'abord **sauvegardée** à côté de la base (`simtrade.db.avant-v1-<date>.bak`), puis migrée en une seule transaction. Le nombre de lignes des comptes, positions et ordres et l'intégrité sont vérifiés avant validation. En cas d'échec, tout est annulé, la base reste dans l'ancien format et le message indique la sauvegarde. Le compte actif devient `principal` (manuel), les anciens comptes `archive-<n°>`.
 
 La base est stockée dans `%LOCALAPPDATA%\simtrade\simtrade.db` (hors du projet et de OneDrive). Pour en utiliser une autre :
 
@@ -84,13 +141,24 @@ Lance un serveur local sur `http://127.0.0.1:8000` (pas accessible depuis le ré
 | GET | `/prix` | | bid, ask, spread, source, heure, âge et `perime` de chaque cotation |
 | POST | `/ordres/achat` | `{"paire": "btc", "montant": "500"}` | ordre exécuté + solde |
 | POST | `/ordres/vente` | `{"paire": "eth", "quantite": "0.05"}` ou `"tout"` | ordre exécuté + solde |
+| POST | `/ordres/limite` | `{"paire": "btc", "sens": "achat", "prix": "78000", "montant": "500"}` (vente : `quantite`) | ordre en attente |
+| POST | `/ordres/stop`, `/ordres/objectif` | `{"paire": "btc", "prix": "76000", "quantite": "tout"}` (`quantite` facultative) | ordre en attente |
+| POST | `/ordres/stop-objectif` | `{"paire": "sol", "stop": "90", "objectif": "120"}` | les deux ordres liés |
+| GET | `/ordres/attente?tous=false` | | ordres en attente (`tous=true` : aussi exécutés, annulés, rejetés) |
+| DELETE | `/ordres/{n°}` | | ordres annulés (avec l'ordre lié) |
 | GET | `/portefeuille` | | positions, valeur, P&L, frais, performance |
-| GET | `/historique` | | compte actif + ordres |
+| GET | `/historique` | | compte + ordres (avec `type_ordre`, `prix_declenchement`, `glissement`) |
 | POST | `/reset` | `{"capital": "2500"}` (facultatif, défaut 10000) | nouveau compte |
-| GET | `/info` | | chemin de la base, compte actif, état des flux (`flux`, `flux_volume`), `historique`, `horloge` |
+| GET | `/comptes?archives=false` | | comptes ouverts (ou tous) |
+| POST | `/comptes` | `{"nom": "robot", "capital": "2000", "mode": "auto"}` | compte créé |
+| POST | `/comptes/{nom}/choisir`, `/comptes/{nom}/archiver` | | compte |
+| GET, PUT | `/session` | `{"derniere_entree": "23:00", "cloture": "23:55"}` (PUT) | horaires UTC |
+| GET | `/info` | | chemin de la base, compte courant, `comptes_ouverts`, `comptes_archives`, `session`, état des flux (`flux`, `flux_volume`), `historique`, `horloge` |
 | GET | `/bougies/{paire}?intervalle=1m&limite=100` | | bougies OHLC, volume, notional, transactions, `origine`, `complete`, `cloturee`, `qualite` |
 | GET | `/indicateurs/{paire}?intervalle=1m&fenetre=1440&sma=20&ema=20&rsi=14&inclure_courante=false&vwap=jour_utc` | | SMA, EMA, RSI, VWAP, variation, volume, `qualite` |
 | WS | `/ws/prix` | | chaque cotation en direct (d'abord le cache, puis les mises à jour) |
+
+Les routes d'ordres, `/ordres/attente`, `/portefeuille`, `/historique`, `/reset` et `DELETE /ordres/{n°}` acceptent `?compte=<nom ou n°>` (compte courant par défaut).
 
 **Nombres** : envoyés et renvoyés **en chaîne** (`"0.00000001"`, jamais de float ni de `1E-8`). Un nombre JSON (`"montant": 500`) est refusé.
 
@@ -154,17 +222,21 @@ Paramètre invalide (intervalle ou ancrage inconnu, entier ou booléen illisible
 python -m pytest
 ```
 
-Les tests couvrent le moteur (frais, prix moyen, P&L réalisé/latent, performance, refus d'ordres, validation du capital), la persistance (redémarrage, reset, transactions), le parsing des messages Binance/Coinbase, la bascule entre sources, les commandes CLI, les routes de l'API, la reconnexion du flux, le refus des cotations périmées, la construction des bougies, le raccord avec l'historique (klines simulées par `httpx.MockTransport`), les indicateurs (valeurs calculées à la main), la qualité des données et les routes de marché. Ils utilisent des données simulées ; une garde dans `tests/conftest.py` fait échouer tout test qui tenterait une résolution de nom ou une connexion hors de la machine.
+Les tests couvrent le moteur (frais, prix moyen, P&L réalisé/latent, performance, refus d'ordres, validation du capital), la persistance (redémarrage, reset, transactions), le parsing des messages Binance/Coinbase, la bascule entre sources, les commandes CLI, les routes de l'API, la reconnexion du flux, le refus des cotations périmées, la construction des bougies, le raccord avec l'historique (klines simulées par `httpx.MockTransport`), les indicateurs (valeurs calculées à la main), la qualité des données et les routes de marché. Pour l'étape 4 : déclenchement et glissement des ordres en attente (dont un stop sauté), exécution par le flux, paires liées, réservations, redémarrage, ordres posés ou annulés par une autre connexion, comptes en parallèle, entrées refusées après l'heure limite, clôture de fin de session, clôture reportée et rattrapage (horloge simulée), migration d'une base des étapes 1 à 3 et annulation complète en cas d'échec. Ils utilisent des données simulées ; une garde dans `tests/conftest.py` fait échouer tout test qui tenterait une résolution de nom ou une connexion hors de la machine.
 
 ## Architecture
 
 ```
 simtrade/
-  models.py    structures de données (Quote, Position, Account, Order)
-  engine.py    moteur pur : calculs, frais, refus, validation (aucun I/O)
-  storage.py   SQLite : comptes, positions, ordres
+  models.py    structures de données (Quote, Position, Account, Order, PendingOrder)
+  engine.py    moteur pur : calculs, frais, refus, réservations, validation (aucun I/O)
+  orders.py    règles pures des ordres en attente : déclenchement, glissement, refus à la pose
+  sessions.py  règles pures des sessions : dernière entrée, clôture, retard
+  storage.py   SQLite : comptes, positions, ordres, ordres en attente, sessions, réglages
+  migrations.py  mise à niveau du schéma (sauvegarde, transaction unique, contrôles)
   feeds/       sources de prix : Binance, Coinbase, bascule, source simulée
   service.py   TradingService : point d'entrée unique des interfaces
+  watcher.py   OrderWatcher (ordres touchés par chaque cotation) et SessionScheduler (clôtures)
   market.py    calculs de marché purs : bougies OHLC, raccord avec les klines, SMA, EMA, RSI, VWAP, variation, qualité (aucun I/O)
   history.py   historique public Binance (REST) : klines paginées, heure du serveur
   hub.py       PriceHub (cotations + transactions, cache, bougies, raccord avec l'historique, reconnexion) et CachedFeed
@@ -172,13 +244,19 @@ simtrade/
   cli.py       ligne de commande
 ```
 
-L'API ne fait qu'appeler `TradingService`, qui reçoit un `CachedFeed` à la place d'une connexion directe.
+L'API ne fait qu'appeler `TradingService`, qui reçoit un `CachedFeed` à la place d'une connexion directe. Dans l'API, `PriceHub` appelle `OrderWatcher` pour **chaque** cotation reçue (sans file d'attente, donc sans cotation sautée) ; le watcher garde les ordres en attente en mémoire et ne touche la base que pour exécuter. Il recharge sa liste après chaque changement fait par le service, et chaque seconde si une autre connexion (la CLI) a écrit dans la base (`PRAGMA data_version`).
 
 ## Limites
 
 - **Tout est en USDT.** Pas de conversion en EUR, pas d'autres paires que les trois listées.
 - **Pas de carnet d'ordres complet** : seul le meilleur bid/ask est utilisé. Un gros ordre est exécuté entièrement à ce prix, sans glissement (*slippage*), ce qui est optimiste pour de gros montants.
-- **Ordres au marché uniquement** : pas d'ordres limites ni de stop pour l'instant.
+- **Ordres en attente exécutés seulement quand l'API tourne.** La CLI pose, liste et annule, mais ne surveille rien : sans `python -m simtrade api` lancé, aucun stop ne part et aucune session n'est fermée.
+- **Les ordres ne se déclenchent que sur une cotation reçue en direct** (de moins de 5 s). Flux coupé : rien ne se déclenche ; à la reconnexion, la première cotation est évaluée et, si le prix a sauté le stop, l'ordre est exécuté à ce prix avec le glissement enregistré.
+- **Redémarrage** : les ordres en attente sont en base et rechargés au démarrage de l'API, puis évalués sur la première cotation fraîche. Un prix qui a touché le stop puis est revenu pendant l'arrêt **n'exécute pas** l'ordre (il l'aurait été en vrai) : le chemin du prix pendant l'arrêt est inconnu.
+- **Clôture tardive au prix du moment** (première cotation fraîche), pas à celui de l'heure de clôture.
+- **Repli Coinbase** : les ordres continuent de se déclencher sur le bid/ask Coinbase, dont le spread est plus large ; un stop peut donc partir plus tôt. La source est enregistrée sur chaque ordre.
+- **Déclenchement sur le meilleur bid/ask**, pas sur le dernier prix de transaction comme Binance : un stop peut partir sur un simple écartement du spread.
+- **Pas d'intervention manuelle sur un compte automatique** autre que par les mêmes routes, qui le traitent comme automatique (règles de session comprises).
 - **CLI : une connexion websocket par commande** : chaque commande met 1 à 4 s à obtenir un prix (le temps d'établir la connexion). L'API n'a pas ce délai.
 - **Coinbase en secours est moins liquide en USDT** : le spread BTC-USDT y est nettement plus large que sur Binance (constaté : environ 3,5 pb contre moins de 0,01 pb), et le canal ticker ne se met à jour qu'à chaque transaction.
 - CLI : pas de reconnexion automatique si le flux continu `prix` est coupé en cours de route (l'API, elle, se reconnecte).
@@ -188,5 +266,5 @@ L'API ne fait qu'appeler `TradingService`, qui reçoit un `CachedFeed` à la pla
 - **Volume** : celui de la source qui répond, pas un volume global. En repli sur Coinbase, l'historique reste celui de Binance : bougies de deux places différentes, VWAP signalé non fiable. Sur Coinbase, les paires USDT sont peu échangées et la source de transactions est jugée muette si rien n'arrive en 15 s.
 - Ouvrir l'API ouvre **deux** connexions websocket (cotations et transactions) et environ 15 requêtes REST au démarrage, puis environ 3 à 5 par minute pour la réconciliation.
 - API sans authentification : elle n'écoute que sur 127.0.0.1, ne pas l'exposer sur le réseau.
-- Un seul utilisateur, un seul compte actif à la fois.
+- Un seul utilisateur (plusieurs comptes fictifs, mais aucune notion de propriétaire).
 - Simulation pédagogique : ni conseil financier, ni lien avec un vrai compte.
