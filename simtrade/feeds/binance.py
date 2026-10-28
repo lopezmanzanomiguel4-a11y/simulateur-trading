@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import json
 from collections.abc import AsyncIterator, Sequence
+from datetime import timedelta
 
 from websockets.asyncio.client import connect
 
 from simtrade.feeds.base import PriceFeed
-from simtrade.models import Quote, Trade, clean_decimal, utcnow
+from simtrade.models import EPOCH, Quote, Trade, clean_decimal, utcnow
 
 BINANCE_URL = "wss://stream.binance.com:443/stream?streams="
 
@@ -28,16 +29,20 @@ def parse_message(raw: str | bytes) -> Quote | None:
 
 
 def parse_trade(raw: str | bytes) -> Trade | None:
+    """aggTrade : T = heure de la transaction (ms), f..l = transactions individuelles regroupées."""
     msg = json.loads(raw)
     data = msg.get("data", msg)
-    if data.get("e") != "aggTrade" or not all(k in data for k in ("s", "p", "q")):
+    if data.get("e") != "aggTrade" or not all(k in data for k in ("s", "p", "q", "T")):
         return None
+    count = int(data["l"]) - int(data["f"]) + 1 if "f" in data and "l" in data else 1
     return Trade(
         pair=data["s"],
         price=clean_decimal(data["p"]),
         quantity=clean_decimal(data["q"]),
         source=BinanceFeed.name,
         received_at=utcnow(),
+        traded_at=EPOCH + timedelta(milliseconds=int(data["T"])),
+        count=count,
     )
 
 

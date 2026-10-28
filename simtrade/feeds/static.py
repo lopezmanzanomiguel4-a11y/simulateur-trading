@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Sequence
+from datetime import datetime
 from decimal import Decimal
 
 from simtrade.feeds.base import PriceFeed
@@ -22,8 +23,16 @@ class StaticFeed(PriceFeed):
     def set(self, pair: str, bid: str | Decimal, ask: str | Decimal) -> None:
         self.quotes[pair] = Quote(pair, Decimal(bid), Decimal(ask), self.name, utcnow())
 
-    def add_trade(self, pair: str, price: str | Decimal, quantity: str | Decimal) -> None:
-        self.pending_trades.append(Trade(pair, Decimal(price), Decimal(quantity), self.name, utcnow()))
+    def add_trade(
+        self,
+        pair: str,
+        price: str | Decimal,
+        quantity: str | Decimal,
+        traded_at: datetime | None = None,
+        count: int = 1,
+    ) -> None:
+        now = utcnow()
+        self.pending_trades.append(Trade(pair, Decimal(price), Decimal(quantity), self.name, now, traded_at or now, count))
 
     async def stream(self, pairs: Sequence[str]) -> AsyncIterator[Quote]:
         for pair in pairs:

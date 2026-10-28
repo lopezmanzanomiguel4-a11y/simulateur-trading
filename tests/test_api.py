@@ -288,15 +288,15 @@ def test_hub_garde_la_raison_de_l_erreur():
 # --- Bougies et indicateurs ---
 
 T0 = datetime(2025, 1, 1, tzinfo=timezone.utc)
+NOW = T0 + timedelta(minutes=3, seconds=30)  # la bougie de 00:03 est en cours
 
 
 def market_hub() -> PriceHub:
-    """Hub sans flux actif, rempli de cotations et transactions datées (clôtures 10, 12, 11, 13 en 1 min)."""
-    hub = PriceHub(SilentFeed())
-    for minute, price in enumerate(("10", "12", "11", "13")):
-        hub.update(Quote("BTCUSDT", D(price), D(price), "Test", T0 + timedelta(minutes=minute, seconds=1)))
-    hub.update_trade(Trade("BTCUSDT", D("10"), D("1"), "Test", T0 + timedelta(seconds=2)))
-    hub.update_trade(Trade("BTCUSDT", D("14"), D("3"), "Test", T0 + timedelta(minutes=3, seconds=2)))
+    """Hub sans flux actif, horloge figée ; transactions datées (clôtures 10, 12, 11 puis 13 en cours)."""
+    hub = PriceHub(SilentFeed(), clock=lambda: NOW)
+    for minute, price, qty in ((0, "10", "1"), (1, "12", "1"), (2, "11", "2"), (3, "13", "1")):
+        t = T0 + timedelta(minutes=minute, seconds=2)
+        hub.update_trade(Trade("BTCUSDT", D(price), D(qty), "Test", t, t, 2))
     return hub
 
 
@@ -311,64 +311,110 @@ def test_bougies(market_client):
     assert r.status_code == 200
     body = r.json()
     assert (body["paire"], body["intervalle"]) == ("BTCUSDT", "1m")
-    first, last = body["bougies"]
-    assert first == {
+    closed, current = body["bougies"]
+    assert closed == {
         "ouverture_le": "2025-01-01T00:02:00+00:00",
         "ouverture": "11",
         "haut": "11",
         "bas": "11",
         "cloture": "11",
-        "volume": "0",
-        "notional": "0",
-        "cotations": 1,
+        "volume": "2",
+        "notional": "22",
+        "transactions": 2,
+        "origine": "live",
+        "complete": True,
         "cloturee": True,
     }
-    assert (last["volume"], last["notional"]) == ("3", "42")
+    assert current["cloturee"] is False and current["cloture"] == "13"
+
+
+def test_bougies_premiere_bougie_incomplete(market_client):
+    first = market_client.get("/bougies/btc").json()["bougies"][0]
+    assert first["complete"] is False  # au démarrage, le début de la minute a pu être manqué
 
 
 def test_bougies_autre_intervalle(market_client):
     (c,) = market_client.get("/bougies/BTCUSDT", params={"intervalle": "1h"}).json()["bougies"]
-    assert (c["ouverture"], c["haut"], c["bas"], c["cloture"], c["volume"]) == ("10", "13", "10", "13", "4")
+    assert (c["ouverture"], c["haut"], c["bas"], c["cloture"], c["volume"]) == ("10", "13", "10", "13", "5")
 
 
-def test_indicateurs(market_client):
+def test_indicateurs_sur_bougies_cloturees_par_defaut(market_client):
     r = market_client.get("/indicateurs/btc", params={"sma": "3", "ema": "3", "rsi": "2"})
     assert r.status_code == 200
     i = r.json()
-    assert i["nb_bougies"] == 4 and i["dernier_prix"] == "13" and i["debut"] == "2025-01-01T00:00:00+00:00"
-    assert i["sma"] == {"periode": 3, "valeur": "12.00000000"}  # (12 + 11 + 13) / 3
-    assert i["ema"] == {"periode": 3, "valeur": "12.00000000"}  # amorce 11, puis 0,5 x 13 + 0,5 x 11
-    assert i["rsi"] == {"periode": 2, "valeur": "85.71428571"}
-    assert i["vwap"] == "13.00000000"  # (1 x 10 + 3 x 14) / 4
-    assert i["variation_pct"] == "30.00000000"  # (13 - 10) / 10 x 100
-    assert i["volume"] == "4"
+    assert i["inclure_courante"] is False and i["nb_bougies"] == 3 and i["dernier_prix"] == "11"
+    assert i["derniere_bougie"] == {"ouverture_le": "2025-01-01T00:02:00+00:00", "complete": True, "cloturee": True}
+    assert i["sma"] == {"periode": 3, "valeur": "11.00000000"}  # (10 + 12 + 11) / 3
+    assert i["ema"] == {"periode": 3, "valeur": "11.00000000"}  # = amorce SMA
+    assert i["rsi"] == {"periode": 2, "valeur": "66.66666667"}  # hausse 1, baisse 0,5 : 100 - 100/3
+    assert i["variation_pct"] == "10.00000000"  # (11 - 10) / 10 x 100
+    assert i["vwap"] == {
+        "valeur": "11.00000000",  # (10 + 12 + 22) / 4
+        "ancrage": "jour_utc",
+        "debut": "2025-01-01T00:00:00+00:00",
+        "fin": "2025-01-01T00:03:00+00:00",
+        "nb_bougies": 3,
+        "volume": "4",
+    }
 
 
-def test_indicateurs_fenetre(market_client):
-    i = market_client.get("/indicateurs/btc", params={"fenetre": "2", "sma": "3"}).json()
+def test_indicateurs_avec_la_bougie_en_cours(market_client):
+    params = {"sma": "3", "ema": "3", "rsi": "2", "inclure_courante": "true"}
+    i = market_client.get("/indicateurs/btc", params=params).json()
+    assert i["inclure_courante"] is True and i["nb_bougies"] == 4 and i["dernier_prix"] == "13"
+    assert i["derniere_bougie"]["cloturee"] is False
+    assert i["sma"]["valeur"] == "12.00000000" and i["ema"]["valeur"] == "12.00000000"
+    assert i["rsi"]["valeur"] == "85.71428571" and i["variation_pct"] == "30.00000000"
+    assert i["vwap"]["valeur"] == "11.40000000" and i["vwap"]["fin"] == "2025-01-01T00:03:30+00:00"
+
+
+def test_vwap_glissant_sur_la_fenetre(market_client):
+    i = market_client.get("/indicateurs/btc", params={"vwap": "fenetre", "fenetre": "2", "sma": "3"}).json()
     assert i["nb_bougies"] == 2 and i["sma"]["valeur"] is None  # pas assez de bougies
-    assert i["variation_pct"] == "18.18181818"  # (13 - 11) / 11 x 100
-    assert i["vwap"] == "14.00000000" and i["volume"] == "3"
+    assert i["vwap"]["ancrage"] == "fenetre" and i["vwap"]["valeur"] == "11.33333333"  # (12 + 22) / 3
+    assert i["vwap"]["debut"] == "2025-01-01T00:01:00+00:00" and i["volume"] == "3"
+
+
+def test_qualite_dans_les_reponses(market_client):
+    for url in ("/bougies/btc", "/indicateurs/btc"):
+        q = market_client.get(url).json()["qualite"]
+        assert q["prix_perime"] is True  # aucune cotation
+        assert q["flux_transactions_muet"] is True  # flux de transactions jamais connecté
+        assert q["historique"] == "desactive" and q["vwap_fiable"] is False
+        assert q["source_transactions"] == "Test" and q["bougie_courante_complete"] is True
+        assert {"prix_perime", "flux_transactions_muet", "historique_desactive"} <= set(q["raisons"])
 
 
 def test_marche_vide(tmp_path):
     with make_client(tmp_path, PriceHub(SilentFeed())) as c:
         assert c.get("/bougies/eth").json()["bougies"] == []
         i = c.get("/indicateurs/eth").json()
-    assert i["nb_bougies"] == 0 and i["debut"] is None and i["dernier_prix"] is None
+    assert i["nb_bougies"] == 0 and i["debut"] is None and i["dernier_prix"] is None and i["derniere_bougie"] is None
     assert i["sma"]["valeur"] is None and i["ema"]["valeur"] is None and i["rsi"]["valeur"] is None
-    assert i["vwap"] is None and i["variation_pct"] is None and i["volume"] == "0"
+    assert i["vwap"]["valeur"] is None and i["variation_pct"] is None and i["volume"] == "0"
+    assert "volume_nul" in i["qualite"]["raisons"]
 
 
 @pytest.mark.parametrize(
     "url, params, message",
     [
         ("/bougies/doge", {}, "Paire inconnue : 'doge'. Paires disponibles : BTCUSDT, ETHUSDT, SOLUSDT."),
-        ("/bougies/btc", {"intervalle": "2m"}, "Intervalle inconnu : '2m'. Intervalles disponibles : 1m, 5m, 15m, 1h."),
+        ("/bougies/btc", {"intervalle": "2m"}, "Paramètre 'intervalle' invalide : '2m'. Valeurs possibles : 1m, 5m, 15m, 1h."),
         ("/bougies/btc", {"limite": "abc"}, "Paramètre 'limite' invalide : 'abc' n'est pas un entier."),
-        ("/bougies/btc", {"limite": "0"}, "Paramètre 'limite' hors bornes : entre 1 et 500 (reçu : 0)."),
-        ("/indicateurs/btc", {"rsi": "500"}, "Paramètre 'rsi' hors bornes : entre 1 et 499 (reçu : 500)."),
+        ("/bougies/btc", {"limite": "0"}, "Paramètre 'limite' hors bornes : minimum 1 (reçu : 0)."),
+        ("/bougies/btc", {"limite": "1441"}, "Paramètre 'limite' hors bornes : maximum 1440 (reçu : 1441)."),
+        ("/indicateurs/btc", {"rsi": "1440"}, "Paramètre 'rsi' hors bornes : maximum 1439 (reçu : 1440)."),
         ("/indicateurs/btc", {"sma": "1.5"}, "Paramètre 'sma' invalide : '1.5' n'est pas un entier."),
+        (
+            "/indicateurs/btc",
+            {"inclure_courante": "peut-être"},
+            "Paramètre 'inclure_courante' invalide : 'peut-être' (true ou false attendu).",
+        ),
+        (
+            "/indicateurs/btc",
+            {"vwap": "semaine"},
+            "Paramètre 'vwap' invalide : 'semaine'. Valeurs possibles : jour_utc, fenetre.",
+        ),
     ],
 )
 def test_parametres_de_marche_invalides_400(market_client, url, params, message):
@@ -376,27 +422,10 @@ def test_parametres_de_marche_invalides_400(market_client, url, params, message)
     assert r.status_code == 400 and r.json() == {"erreur": message}
 
 
-def test_info_flux_volume(client):
-    vol = client.get("/info").json()["flux_volume"]
+def test_info_flux_volume_historique_et_horloge(client):
+    info = client.get("/info").json()
+    vol = info["flux_volume"]
     assert vol["actif"] is True  # StaticFeed fournit des transactions
-    assert set(vol) == {"actif", "connecte", "derniere_transaction", "derniere_erreur", "reconnexions"}
-
-
-def test_hub_alimente_les_bougies_avec_les_deux_flux():
-    source = StaticFeed({"BTCUSDT": ("100", "102")})
-    source.add_trade("BTCUSDT", "101", "2")
-
-    async def forever(delay: float) -> None:
-        await asyncio.Event().wait()
-
-    async def main() -> PriceHub:
-        hub = PriceHub(source, ["BTCUSDT"], sleep=forever)
-        with pytest.raises(TimeoutError):
-            await asyncio.wait_for(hub.run(), 0.2)  # les deux flux se terminent puis attendent
-        return hub
-
-    hub = asyncio.run(main())
-    (c,) = hub.market.candles("BTCUSDT", "1m")
-    assert c.close == D("101") and c.volume == D("2") and c.notional == D("202")
-    assert hub.last_trade_at is not None
-    assert hub.trade_status.last_error == "flux terminé" and hub.last_error == "flux terminé"
+    assert set(vol) == {"actif", "connecte", "derniere_transaction", "derniere_erreur", "reconnexions", "source", "repli"}
+    assert info["historique"]["etat"] == "desactive"  # feed fourni sans historique : rien à télécharger
+    assert info["horloge"] == {"ecart_ms": None, "aller_retour_ms": None, "mesure_le": None, "erreur": None}

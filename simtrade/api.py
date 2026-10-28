@@ -14,7 +14,7 @@ from datetime import datetime
 from decimal import Decimal
 
 import anyio
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -25,7 +25,7 @@ from simtrade.engine import DEFAULT_CAPITAL, normalize_pair
 from simtrade.errors import FeedUnavailable, InvalidCapital, InvalidInput, OrderRejected, SimTradeError
 from simtrade.feeds.base import PriceFeed
 from simtrade.hub import CachedFeed, PriceHub
-from simtrade.models import Account, Order, Quote, utcnow
+from simtrade.models import Account, Order, Quote
 from simtrade.service import TradeResult, TradingService
 from simtrade.storage import Storage
 
@@ -121,7 +121,9 @@ def candle_json(candle: market.Candle, now: datetime) -> dict:
         "cloture": dec(candle.close),
         "volume": dec(candle.volume),
         "notional": dec(candle.notional),
-        "cotations": candle.ticks,
+        "transactions": candle.transactions,
+        "origine": candle.origin,
+        "complete": candle.complete,
         "cloturee": candle.is_closed(now),
     }
 
@@ -130,23 +132,56 @@ def opt(value: Decimal | None) -> str | None:
     return None if value is None else dec(value)
 
 
-# --- Paramètres de requête (lus en chaîne pour garder nos propres messages d'erreur) ---
+def opt_iso(dt: datetime | None) -> str | None:
+    return None if dt is None else iso(dt)
 
 
-def interval_param(raw: str) -> str:
-    if raw not in market.INTERVALS:
-        raise InvalidInput(f"Intervalle inconnu : '{raw}'. Intervalles disponibles : {', '.join(market.INTERVALS)}.")
-    return raw
+def vwap_json(result: market.VwapResult) -> dict:
+    return {
+        "valeur": opt(result.value),
+        "ancrage": result.anchor,
+        "debut": opt_iso(result.start),
+        "fin": opt_iso(result.end),
+        "nb_bougies": result.count,
+        "volume": dec(result.volume),
+    }
 
 
-def int_param(raw: str, label: str, low: int = 1, high: int = market.MAX_CANDLES) -> int:
-    try:
-        value = int(raw)
-    except ValueError:
-        raise InvalidInput(f"Paramètre '{label}' invalide : '{raw}' n'est pas un entier.") from None
-    if not low <= value <= high:
-        raise InvalidInput(f"Paramètre '{label}' hors bornes : entre {low} et {high} (reçu : {raw}).")
-    return value
+def quality_json(q: market.Quality) -> dict:
+    return {
+        "prix_perime": q.prix_perime,
+        "flux_transactions_muet": q.flux_transactions_muet,
+        "source_transactions": q.source_transactions,
+        "repli_coinbase": q.repli_coinbase,
+        "historique": q.historique,
+        "derniere_synchro": opt_iso(q.derniere_synchro),
+        "bougie_courante_complete": q.bougie_courante_complete,
+        "ecart_horloge_ms": None if q.ecart_horloge is None else round(q.ecart_horloge * 1000),
+        "vwap_fiable": q.vwap_fiable,
+        "raisons": list(q.raisons),
+    }
+
+
+# --- Erreurs de paramètres de requête (la query string, pas le corps JSON) ---
+
+QUERY_CHOICES = {"intervalle": tuple(market.INTERVALS), "vwap": market.VWAP_ANCHORS}
+
+
+def query_error_message(error: dict) -> str:
+    name, raw, ctx = error["loc"][-1], error.get("input"), error.get("ctx") or {}
+    kind = error["type"]
+    if kind == "int_parsing":
+        return f"Paramètre '{name}' invalide : '{raw}' n'est pas un entier."
+    if kind == "greater_than_equal":
+        return f"Paramètre '{name}' hors bornes : minimum {ctx.get('ge')} (reçu : {raw})."
+    if kind == "less_than_equal":
+        return f"Paramètre '{name}' hors bornes : maximum {ctx.get('le')} (reçu : {raw})."
+    if kind == "literal_error":
+        choices = ", ".join(QUERY_CHOICES.get(name, ()))
+        return f"Paramètre '{name}' invalide : '{raw}'. Valeurs possibles : {choices}."
+    if kind == "bool_parsing":
+        return f"Paramètre '{name}' invalide : '{raw}' (true ou false attendu)."
+    return f"Paramètre '{name}' invalide : '{raw}'."
 
 
 # --- Application ---
@@ -172,6 +207,7 @@ def create_app(service: ServiceFactory | None = None, hub: PriceHub | None = Non
             except asyncio.CancelledError:
                 pass
             svc.storage.close()
+            await price_hub.aclose()
 
     app = FastAPI(title="Simulateur de paper trading", lifespan=lifespan)
 
@@ -182,6 +218,9 @@ def create_app(service: ServiceFactory | None = None, hub: PriceHub | None = Non
 
     @app.exception_handler(RequestValidationError)
     async def validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
+        query = [e for e in exc.errors() if e.get("loc", ())[:1] == ("query",)]
+        if query:
+            return JSONResponse({"erreur": query_error_message(query[0])}, status_code=400)
         # loc = ("body", "<champ>") pour un champ ; ("body", <position>) pour un JSON illisible.
         fields = [
             e["loc"][1]
@@ -271,46 +310,85 @@ def create_app(service: ServiceFactory | None = None, hub: PriceHub | None = Non
                 "derniere_transaction": iso(h.last_trade_at) if h.last_trade_at else None,
                 "derniere_erreur": h.trade_status.last_error,
                 "reconnexions": h.trade_status.reconnects,
+                "source": h.trade_source,
+                "repli": h.trade_fallback,
+            },
+            "historique": {
+                "etat": h.history_overall(),
+                "derniere_synchro": opt_iso(h.last_sync),
+                "derniere_erreur": h.history_error,
+            },
+            "horloge": {
+                "ecart_ms": round(h.clock_offset.offset * 1000) if h.clock_offset else None,
+                "aller_retour_ms": round(h.clock_offset.round_trip * 1000) if h.clock_offset else None,
+                "mesure_le": iso(h.clock_offset.measured_at) if h.clock_offset else None,
+                "erreur": h.clock_error,
             },
         }
 
-    def market_of(request: Request) -> market.MarketData:
-        return request.app.state.hub.market
+    def hub_of(request: Request) -> PriceHub:
+        return request.app.state.hub
+
+    def session_vwap(h: PriceHub, pair: str, now: datetime, inclure_courante: bool) -> market.VwapResult:
+        candles = h.market.candles(pair, "1m")
+        return market.vwap_session(candles if inclure_courante else market.closed(candles, now), now)
 
     @app.get("/bougies/{paire}")
-    async def bougies(paire: str, request: Request, intervalle: str = "1m", limite: str = "100") -> dict:
-        pair, interval = normalize_pair(paire), interval_param(intervalle)
-        candles = market_of(request).candles(pair, interval, int_param(limite, "limite"))
-        now = utcnow()
-        return {"paire": pair, "intervalle": interval, "bougies": [candle_json(c, now) for c in candles]}
+    async def bougies(
+        paire: str,
+        request: Request,
+        intervalle: market.IntervalName = "1m",
+        limite: int = Query(100, ge=1, le=market.LIMIT_MAX),
+    ) -> dict:
+        h, pair = hub_of(request), normalize_pair(paire)
+        now = h.clock()
+        candles = h.market.candles(pair, intervalle, limite)
+        volume = session_vwap(h, pair, now, False).volume
+        return {
+            "paire": pair,
+            "intervalle": intervalle,
+            "bougies": [candle_json(c, now) for c in candles],
+            "qualite": quality_json(h.quality(pair, intervalle, volume)),
+        }
 
     @app.get("/indicateurs/{paire}")
     async def indicateurs(
         paire: str,
         request: Request,
-        intervalle: str = "1m",
-        fenetre: str = str(market.MAX_CANDLES),
-        sma: str = "20",
-        ema: str = "20",
-        rsi: str = "14",
+        intervalle: market.IntervalName = "1m",
+        fenetre: int = Query(market.LIMIT_MAX, ge=1, le=market.LIMIT_MAX),
+        sma: int = Query(20, ge=1, le=market.LIMIT_MAX),
+        ema: int = Query(20, ge=1, le=market.LIMIT_MAX),
+        rsi: int = Query(14, ge=1, le=market.LIMIT_MAX - 1),
+        inclure_courante: bool = False,
+        vwap: market.VwapAnchor = "jour_utc",
     ) -> dict:
-        pair, interval = normalize_pair(paire), interval_param(intervalle)
-        n_sma, n_ema = int_param(sma, "sma"), int_param(ema, "ema")
-        n_rsi = int_param(rsi, "rsi", high=market.MAX_CANDLES - 1)
-        candles = market_of(request).candles(pair, interval, int_param(fenetre, "fenetre"))
+        h, pair = hub_of(request), normalize_pair(paire)
+        now = h.clock()
+        candles = h.market.candles(pair, intervalle)
+        if not inclure_courante:
+            candles = market.closed(candles, now)
+        candles = candles[-fenetre:]
         closes = [c.close for c in candles]
+        vw = market.vwap_window(candles) if vwap == "fenetre" else session_vwap(h, pair, now, inclure_courante)
+        last = candles[-1] if candles else None
         return {
             "paire": pair,
-            "intervalle": interval,
+            "intervalle": intervalle,
+            "inclure_courante": inclure_courante,
             "nb_bougies": len(candles),
-            "debut": iso(candles[0].open_time) if candles else None,
+            "debut": opt_iso(candles[0].open_time if candles else None),
+            "derniere_bougie": None
+            if last is None
+            else {"ouverture_le": iso(last.open_time), "complete": last.complete, "cloturee": last.is_closed(now)},
             "dernier_prix": opt(closes[-1]) if closes else None,
-            "sma": {"periode": n_sma, "valeur": opt(market.sma(closes, n_sma))},
-            "ema": {"periode": n_ema, "valeur": opt(market.ema(closes, n_ema))},
-            "rsi": {"periode": n_rsi, "valeur": opt(market.rsi(closes, n_rsi))},
-            "vwap": opt(market.vwap(candles)),
+            "sma": {"periode": sma, "valeur": opt(market.sma(closes, sma))},
+            "ema": {"periode": ema, "valeur": opt(market.ema(closes, ema))},
+            "rsi": {"periode": rsi, "valeur": opt(market.rsi(closes, rsi))},
+            "vwap": vwap_json(vw),
             "variation_pct": opt(market.variation_pct(candles)),
             "volume": dec(sum((c.volume for c in candles), Decimal(0))),
+            "qualite": quality_json(h.quality(pair, intervalle, vw.volume)),
         }
 
     @app.websocket("/ws/prix")

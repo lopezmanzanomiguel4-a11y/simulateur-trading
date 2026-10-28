@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+from datetime import datetime, timezone
 from decimal import Decimal
 
 import pytest
@@ -98,12 +99,22 @@ def test_parse_binance_agg_trade():
     raw = json.dumps(
         {
             "stream": "btcusdt@aggTrade",
-            "data": {"e": "aggTrade", "s": "BTCUSDT", "a": 1, "p": "80660.01000000", "q": "0.00125000", "m": False},
+            "data": {
+                "e": "aggTrade", "E": 1735689600200, "s": "BTCUSDT", "a": 1, "p": "80660.01000000",
+                "q": "0.00125000", "f": 100, "l": 104, "T": 1735689600123, "m": False,
+            },
         }
     )
     t = binance.parse_trade(raw)
     assert (t.pair, t.price, t.quantity, t.source) == ("BTCUSDT", D("80660.01"), D("0.00125"), "Binance")
+    assert t.traded_at == datetime(2025, 1, 1, 0, 0, 0, 123000, tzinfo=timezone.utc)  # champ T, pas l'heure locale
+    assert t.count == 5  # transactions 100 à 104 regroupées
     assert binance.parse_message(raw) is None  # pas une cotation
+
+
+def test_parse_binance_agg_trade_sans_heure_ignore():
+    raw = json.dumps({"data": {"e": "aggTrade", "s": "BTCUSDT", "p": "1", "q": "1"}})
+    assert binance.parse_trade(raw) is None
 
 
 def test_parse_binance_trade_ignore_book_ticker():
@@ -113,9 +124,15 @@ def test_parse_binance_trade_ignore_book_ticker():
 
 def test_parse_coinbase_match():
     products = {"ETH-USDT": "ETHUSDT"}
-    raw = json.dumps({"type": "match", "product_id": "ETH-USDT", "price": "2350.10", "size": "0.5000", "side": "buy"})
+    raw = json.dumps(
+        {
+            "type": "match", "product_id": "ETH-USDT", "price": "2350.10", "size": "0.5000", "side": "buy",
+            "time": "2025-01-01T00:00:59.987654Z",
+        }
+    )
     t = coinbase.parse_match(raw, products)
-    assert (t.pair, t.price, t.quantity, t.source) == ("ETHUSDT", D("2350.1"), D("0.5"), "Coinbase")
+    assert (t.pair, t.price, t.quantity, t.source, t.count) == ("ETHUSDT", D("2350.1"), D("0.5"), "Coinbase", 1)
+    assert t.traded_at == datetime(2025, 1, 1, 0, 0, 59, 987654, tzinfo=timezone.utc)
 
 
 def test_parse_coinbase_last_match_ignore():

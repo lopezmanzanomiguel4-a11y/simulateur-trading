@@ -9,6 +9,7 @@ from enum import Enum
 
 PAIRS: tuple[str, ...] = ("BTCUSDT", "ETHUSDT", "SOLUSDT")
 QUOTE_ASSET = "USDT"
+EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 
 def utcnow() -> datetime:
@@ -57,13 +58,15 @@ class Quote:
 
 @dataclass(frozen=True)
 class Trade:
-    """Transaction exécutée sur la place de marché (sert au volume et au VWAP)."""
+    """Transaction exécutée sur la place de marché (sert aux bougies, au volume et au VWAP)."""
 
     pair: str
     price: Decimal
     quantity: Decimal
     source: str
-    received_at: datetime
+    received_at: datetime  # heure locale de réception
+    traded_at: datetime  # heure de l'exchange : c'est elle qui date les bougies
+    count: int = 1  # transactions individuelles regroupées (aggTrade Binance : l - f + 1)
 
 
 @dataclass

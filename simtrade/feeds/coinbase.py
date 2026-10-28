@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import AsyncIterator, Sequence
+from datetime import datetime
 
 from websockets.asyncio.client import connect
 
@@ -52,7 +53,7 @@ def parse_match(raw: str | bytes, products: dict[str, str]) -> Trade | None:
     if msg.get("type") != "match":
         return None
     pair = products.get(msg.get("product_id", ""))
-    if pair is None or not msg.get("price") or not msg.get("size"):
+    if pair is None or not msg.get("price") or not msg.get("size") or not msg.get("time"):
         return None
     return Trade(
         pair=pair,
@@ -60,6 +61,7 @@ def parse_match(raw: str | bytes, products: dict[str, str]) -> Trade | None:
         quantity=clean_decimal(msg["size"]),
         source=CoinbaseFeed.name,
         received_at=utcnow(),
+        traded_at=datetime.fromisoformat(msg["time"]),  # heure de la transaction, ISO 8601 en UTC
     )
 
 
