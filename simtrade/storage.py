@@ -8,18 +8,20 @@ est celui utilisé quand aucun compte n'est précisé.
 
 from __future__ import annotations
 
+import json
 import re
 import sqlite3
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
-from dataclasses import replace
-from datetime import date, datetime
+from dataclasses import dataclass, replace
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
 from simtrade import migrations
 from simtrade.engine import DEFAULT_CAPITAL, Portfolio, validate_capital
 from simtrade.errors import InvalidInput
+from simtrade.risk import RiskLimits
 from simtrade.models import (
     CANCELLED,
     MANUAL,
@@ -88,6 +90,9 @@ class Storage:
         except BaseException:
             self.conn.close()
             raise
+        if self.path != ":memory:":
+            # Lecteurs et écrivain ne se bloquent plus entre eux (API et CLI sur la même base).
+            self.conn.execute("PRAGMA journal_mode = WAL")
 
     def close(self) -> None:
         self.conn.close()
@@ -200,7 +205,13 @@ class Storage:
         with self.transaction():
             old = self.account(account)
             self._archive(old.id, now, "reset")
-            return self._open_account(amount, now, old.name, old.mode, current=old.current)
+            new = self._open_account(amount, now, old.name, old.mode, current=old.current)
+            self.conn.execute(
+                "INSERT INTO risk_limits SELECT ?, max_position_pct, max_session_loss_pct, max_trades, "
+                "max_positions, min_entry_gap_s FROM risk_limits WHERE account_id = ?",
+                (new.id, old.id),
+            )
+            return new
 
     def _archive(self, account_id: int, now: datetime, reason: str) -> None:
         self.cancel_account_pending(account_id, reason, now)
@@ -300,7 +311,8 @@ class Storage:
             for order in orders:
                 cur = self.conn.execute(
                     "INSERT INTO pending_orders (account_id, pair, kind, side, trigger_price, amount, quantity, "
-                    "status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "status, created_at, protection, stop_price, target_price) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         order.account_id,
                         order.pair,
@@ -311,6 +323,9 @@ class Storage:
                         _opt_str(order.quantity),
                         PENDING,
                         order.created_at.isoformat(),
+                        int(order.protection),
+                        _opt_str(order.stop_price),
+                        _opt_str(order.target_price),
                     ),
                 )
                 saved.append(replace(order, id=cur.lastrowid, status=PENDING))
@@ -351,6 +366,15 @@ class Storage:
             "UPDATE pending_orders SET status = ?, reason = ?, closed_at = ?, order_id = ? "
             "WHERE id = ? AND status = ?",
             (status, reason, now.isoformat(), order_id, pending_id, PENDING),
+        )
+
+    def protection_orders(self, account_id: int, pair: str) -> list[PendingOrder]:
+        """Stop de protection (et objectif lié) en attente sur la paire."""
+        return [o for o in self.pending_orders(account_id) if o.pair == pair and o.protection]
+
+    def set_trigger_price(self, pending_id: int, price: Decimal) -> None:
+        self.conn.execute(
+            "UPDATE pending_orders SET trigger_price = ? WHERE id = ? AND status = ?", (str(price), pending_id, PENDING)
         )
 
     def cancel_account_pending(self, account_id: int, reason: str, now: datetime) -> int:
@@ -396,15 +420,122 @@ class Storage:
             for key, value in (("last_entry", rules.last_entry), ("close", rules.close)):
                 self.conn.execute("UPDATE settings SET value = ? WHERE key = ?", (f"{value:%H:%M}", key))
 
+    # --- Garde-fou ---
+
+    def risk_limits(self, account_id: int) -> RiskLimits:
+        """Limites du compte ; les valeurs par défaut de risk.py s'il n'en a pas."""
+        row = self.conn.execute("SELECT * FROM risk_limits WHERE account_id = ?", (account_id,)).fetchone()
+        if row is None:
+            return RiskLimits()
+        return RiskLimits(
+            Decimal(row["max_position_pct"]),
+            Decimal(row["max_session_loss_pct"]),
+            row["max_trades"],
+            row["max_positions"],
+            timedelta(seconds=row["min_entry_gap_s"]),
+        )
+
+    def set_risk_limits(self, account_id: int, limits: RiskLimits) -> None:
+        self.conn.execute(
+            "INSERT INTO risk_limits VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(account_id) DO UPDATE SET "
+            "max_position_pct = excluded.max_position_pct, max_session_loss_pct = excluded.max_session_loss_pct, "
+            "max_trades = excluded.max_trades, max_positions = excluded.max_positions, "
+            "min_entry_gap_s = excluded.min_entry_gap_s",
+            (
+                account_id,
+                str(limits.max_position_pct),
+                str(limits.max_session_loss_pct),
+                limits.max_trades,
+                limits.max_positions,
+                int(limits.min_entry_gap.total_seconds()),
+            ),
+        )
+
+    def add_refusal(self, refusal: RefusalRecord) -> RefusalRecord:
+        cur = self.conn.execute(
+            "INSERT INTO risk_refusals (account_id, created_at, moment, pair, amount, stop_price, pending_id, "
+            "rules, message, state) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                refusal.account_id,
+                refusal.created_at.isoformat(),
+                refusal.moment,
+                refusal.pair,
+                _opt_str(refusal.amount),
+                _opt_str(refusal.stop_price),
+                refusal.pending_id,
+                ",".join(refusal.rules),
+                refusal.message,
+                json.dumps(refusal.state, ensure_ascii=False),
+            ),
+        )
+        return replace(refusal, id=cur.lastrowid)
+
+    def refusals(self, account_id: int | None = None, limit: int = 100) -> list[RefusalRecord]:
+        """Refus du garde-fou, du plus récent au plus ancien."""
+        sql, args = "SELECT * FROM risk_refusals", []
+        if account_id is not None:
+            sql += " WHERE account_id = ?"
+            args.append(account_id)
+        rows = self.conn.execute(sql + " ORDER BY id DESC LIMIT ?", (*args, limit))
+        return [
+            RefusalRecord(
+                account_id=r["account_id"],
+                created_at=datetime.fromisoformat(r["created_at"]),
+                moment=r["moment"],
+                pair=r["pair"],
+                amount=_opt_dec(r["amount"]),
+                stop_price=_opt_dec(r["stop_price"]),
+                pending_id=r["pending_id"],
+                rules=tuple(r["rules"].split(",")),
+                message=r["message"],
+                state=json.loads(r["state"]),
+                id=r["id"],
+            )
+            for r in rows
+        ]
+
+    def halt_session(self, account_id: int, day: date, now: datetime, reason: str) -> None:
+        if not self.session_halted(account_id, day):
+            self.conn.execute(
+                "INSERT INTO session_halts (account_id, date, created_at, reason) VALUES (?, ?, ?, ?)",
+                (account_id, day.isoformat(), now.isoformat(), reason),
+            )
+
+    def session_halted(self, account_id: int, day: date) -> bool:
+        row = self.conn.execute(
+            "SELECT 1 FROM session_halts WHERE account_id = ? AND date = ?", (account_id, day.isoformat())
+        ).fetchone()
+        return row is not None
+
+
+@dataclass(frozen=True)
+class RefusalRecord:
+    """Entrée du journal des refus du garde-fou."""
+
+    account_id: int
+    created_at: datetime
+    moment: str
+    pair: str
+    amount: Decimal | None
+    stop_price: Decimal | None
+    pending_id: int | None
+    rules: tuple[str, ...]
+    message: str
+    state: dict
+    id: int | None = None
+
 
 def _reservations(
     pending: Sequence[PendingOrder], positions: dict[str, Position]
 ) -> tuple[Decimal, dict[str, Decimal]]:
-    """USDT bloqués par les achats limites ; quantités bloquées par les ventes (un groupe lié compte une fois)."""
+    """USDT bloqués par les achats limites ; quantités bloquées par les ventes (un groupe lié compte une fois).
+
+    Les stops de protection (et leur objectif) ne bloquent rien : une vente reste toujours possible.
+    """
     cash = sum((p.amount for p in pending if p.side is Side.BUY and p.amount is not None), Decimal(0))
     by_group: dict[tuple[str, object], Decimal] = {}
     for p in pending:
-        if p.side is not Side.SELL:
+        if p.side is not Side.SELL or p.protection:
             continue
         held = positions[p.pair].quantity if p.pair in positions else Decimal(0)
         qty = held if p.quantity is None else p.quantity
@@ -478,4 +609,7 @@ def _pending(row: sqlite3.Row) -> PendingOrder:
         created_at=datetime.fromisoformat(row["created_at"]),
         closed_at=_opt_dt(row["closed_at"]),
         order_id=row["order_id"],
+        protection=bool(row["protection"]),
+        stop_price=_opt_dec(row["stop_price"]),
+        target_price=_opt_dec(row["target_price"]),
     )

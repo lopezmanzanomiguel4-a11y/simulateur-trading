@@ -383,5 +383,14 @@ class CachedFeed(PriceFeed):
             quotes[pair] = quote
         return quotes
 
+    def peek(self, pairs: Sequence[str]) -> dict[str, Quote]:
+        """Cotations fraîches du cache, sans attendre ni lever d'erreur (les périmées sont absentes)."""
+        quotes: dict[str, Quote] = {}
+        for pair in pairs:
+            quote = self.hub.quotes.get(pair)
+            if quote is not None and self.age(quote) <= self.max_age:
+                quotes[pair] = quote
+        return quotes
+
     def stream(self, pairs: Sequence[str]) -> AsyncIterator[Quote]:
         return self.hub.subscribe(pairs)

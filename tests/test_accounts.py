@@ -45,7 +45,7 @@ def test_choisir_le_compte_courant(env):
 
 def test_reset_n_archive_que_le_compte_vise(env):
     env.service.create_account("robot", "3000", AUTO)
-    env.run(env.service.buy("btc", "1001", compte="robot"))
+    env.run(env.service.buy("btc", "501", compte="robot", stop="80"))  # <= 20 % de 3000 (garde-fou)
     stop = env.run(env.service.place_order("btc", STOP, "vente", "90", "tout", compte="robot"))
     old = env.service.account("robot")
 

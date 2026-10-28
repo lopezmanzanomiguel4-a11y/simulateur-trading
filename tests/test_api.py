@@ -487,7 +487,7 @@ def test_comptes_en_parallele_via_api(client):
     assert r.status_code == 200 and r.json()["compte"]["mode"] == "auto"
     assert [c["nom"] for c in client.get("/comptes").json()["comptes"]] == ["principal", "robot"]
 
-    r = client.post("/ordres/achat", params={"compte": "robot"}, json={"paire": "sol", "montant": "500"})
+    r = client.post("/ordres/entree", params={"compte": "robot"}, json={"paire": "sol", "montant": "400", "stop": "90"})
     assert r.status_code == 200
     assert client.get("/portefeuille", params={"compte": "robot"}).json()["positions"][0]["paire"] == "SOLUSDT"
     assert client.get("/portefeuille").json()["positions"] == []  # compte courant intact

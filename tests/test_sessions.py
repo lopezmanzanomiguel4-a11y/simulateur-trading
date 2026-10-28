@@ -50,13 +50,13 @@ def test_horaires_invalides_refuses(entry, close):
 def test_entree_auto_refusee_a_partir_de_23h(env):
     env.clock.set(22, 59, 59)
     env.quote("100")
-    env.run(env.service.buy("btc", "100", compte="robot"))
+    env.run(env.service.buy("btc", "100", compte="robot", stop="50"))
     env.clock.set(23, 0)
     env.quote("100")
     with pytest.raises(OrderRejected, match="Hors session"):
-        env.run(env.service.buy("btc", "100", compte="robot"))
+        env.run(env.service.buy("btc", "100", compte="robot", stop="50"))
     with pytest.raises(OrderRejected, match="Hors session"):
-        env.run(env.service.place_order("btc", LIMIT, "achat", "90", "100", compte="robot"))
+        env.run(env.service.place_order("btc", LIMIT, "achat", "90", "100", compte="robot", stop="50"))
     env.run(env.service.sell("btc", "tout", compte="robot"))  # sortir reste permis
 
 
@@ -71,7 +71,7 @@ def test_compte_manuel_jamais_soumis_aux_sessions(env):
 
 
 def test_achat_limite_auto_declenche_hors_session_est_rejete(env):
-    pending = env.run(env.service.place_order("btc", LIMIT, "achat", "90", "500", compte="robot"))
+    pending = env.run(env.service.place_order("btc", LIMIT, "achat", "90", "500", compte="robot", stop="50"))
     env.clock.set(23, 10)
     env.quote("89")
     done = env.storage.get_pending(pending.id)
@@ -85,14 +85,14 @@ def test_horaires_parametrables(env):
     env.clock.set(22, 0)
     env.quote("100")
     with pytest.raises(OrderRejected, match="après 22:00 UTC"):
-        env.run(env.service.buy("btc", "100", compte="robot"))
+        env.run(env.service.buy("btc", "100", compte="robot", stop="50"))
 
 
 # --- Clôture ---
 
 
 def test_cloture_de_fin_de_session(env):
-    env.run(env.service.buy("btc", "1001", compte="robot"))
+    env.run(env.service.buy("btc", "1001", compte="robot", stop="50"))
     target = env.run(env.service.place_order("btc", TARGET, "vente", "150", "tout", compte="robot"))
     env.run(env.service.buy("btc", "1001"))  # compte manuel : ne doit pas bouger
 
@@ -103,7 +103,7 @@ def test_cloture_de_fin_de_session(env):
     env.quote("105", "105.1")
     (closed,) = env.run(env.scheduler.tick())
 
-    assert closed.account.name == "robot" and closed.day == DAY and not closed.late and closed.cancelled == 1
+    assert closed.account.name == "robot" and closed.day == DAY and not closed.late and closed.cancelled == 2  # objectif + stop de protection
     (order,) = closed.orders
     assert (order.kind, order.side, order.price, order.quantity) == (SESSION_CLOSE, Side.SELL, D("105"), D("10"))
     assert robot_positions(env) == {}
@@ -119,7 +119,7 @@ def test_cloture_de_fin_de_session(env):
 
 
 def test_cloture_reportee_tant_que_la_cotation_est_perimee(env):
-    env.run(env.service.buy("btc", "1001", compte="robot"))
+    env.run(env.service.buy("btc", "1001", compte="robot", stop="50"))
     env.clock.set(23, 55)
     env.quote("105", age=10)
     assert env.run(env.scheduler.tick()) == []
@@ -137,7 +137,7 @@ def test_rattrapage_si_l_api_etait_arretee_a_la_cloture(tmp_path):
     first = Env(tmp_path / "r.db", clock)
     first.service.create_account("robot", "10000", AUTO)
     first.quote("100")
-    first.run(first.service.buy("btc", "1001", compte="robot"))
+    first.run(first.service.buy("btc", "1001", compte="robot", stop="50"))
     first.close()  # arrêt avant 23:55
 
     clock.set(8, 0, days=1)  # redémarrage le lendemain matin
@@ -151,14 +151,14 @@ def test_rattrapage_si_l_api_etait_arretee_a_la_cloture(tmp_path):
 
         clock.set(8, 1, days=1)  # nouvelle session : on peut entrer, rien n'est fermé avant 23:55
         second.quote("91")
-        second.run(second.service.buy("btc", "500", compte="robot"))
+        second.run(second.service.buy("btc", "500", compte="robot", stop="50"))
         assert second.run(second.scheduler.tick()) == []
     finally:
         second.close()
 
 
 def test_ordres_en_attente_seuls_annules_a_la_cloture(env):
-    pending = env.run(env.service.place_order("btc", LIMIT, "achat", "90", "500", compte="robot"))
+    pending = env.run(env.service.place_order("btc", LIMIT, "achat", "90", "500", compte="robot", stop="50"))
     env.clock.set(23, 55)
     (closed,) = env.run(env.scheduler.tick())  # aucune position : pas besoin de cotation
     assert closed.orders == [] and closed.cancelled == 1

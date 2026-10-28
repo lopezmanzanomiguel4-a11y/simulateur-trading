@@ -35,7 +35,7 @@ Architecture :
 | 2 | API (FastAPI, PriceHub, cache de prix) | ✅ |
 | 3 | Calculs de marché (bougies, SMA/EMA/RSI/VWAP, historique Binance) | ✅ |
 | 4 | Ordres avancés, sessions intraday et comptes multiples | ✅ |
-| 5 | Garde-fou de risque | ⬜ |
+| 5 | Garde-fou de risque | ✅ |
 | 6 | Briques et stratégies intraday (exécution rapide) | ⬜ |
 | 7 | Journal, statistiques et backtest → catalogue | ⬜ |
 | 8 | Équipe d'agents IA (choix du régime et de la stratégie) | ⬜ |

@@ -1,7 +1,7 @@
 # Simulateur de paper trading crypto
 
 Simulateur d'achat/vente de cryptomonnaies **avec de l'argent fictif** et des **prix réels**, en ligne de commande ou via une API HTTP locale.
-Étapes 1 à 4 d'un projet qui recevra plus tard une interface.
+Étapes 1 à 5 d'un projet qui recevra plus tard une interface.
 
 ## Ce que ça fait
 
@@ -17,6 +17,7 @@ Simulateur d'achat/vente de cryptomonnaies **avec de l'argent fictif** et des **
 - **Ordres en attente** : achat ou vente limite, stop-loss, take-profit (objectif) et paire stop + objectif liée (l'un annule l'autre), exécutés par le flux live de l'API, avec le glissement enregistré quand le prix saute le stop.
 - **Comptes multiples** ouverts en parallèle, chacun avec son capital, en mode **manuel** ou **automatique**.
 - **Sessions intraday** pour les comptes automatiques : plus d'entrée après 23:00 UTC, clôture forcée de toutes les positions à 23:55 UTC (horaires paramétrables), avec rattrapage si l'API était arrêtée.
+- **Garde-fou de risque** sur chaque entrée d'un compte automatique : stop-loss obligatoire, taille max, perte max de session, entrées max, positions max, délai entre entrées. Les refus sont journalisés. Les sorties ne sont jamais bloquées.
 
 ## Installation (Windows / PowerShell)
 
@@ -57,6 +58,17 @@ python -m simtrade objectif btc 85000 0.002         # take-profit sur 0,002 BTC
 python -m simtrade stop-objectif sol 90 120         # stop + objectif liés : le premier exécuté annule l'autre
 python -m simtrade ordres                           # ordres en attente du compte (--tous : aussi exécutés/annulés)
 python -m simtrade annuler 3                        # annule l'ordre n°3 (et son ordre lié)
+```
+
+Entrées avec stop et garde-fou (obligatoires sur un compte automatique) :
+
+```powershell
+python -m simtrade entrer btc 500 --stop 79000 --objectif 82000 -c robot   # achat + stop de protection, d'un bloc
+python -m simtrade limite btc achat 78000 500 --stop 77000 -c robot        # le stop est posé à l'exécution
+python -m simtrade deplacer-stop 4 79500 -c robot   # compte auto : seulement vers le haut
+python -m simtrade risque -c robot                  # limites du compte
+python -m simtrade risque -c robot taille=30 perte=1.5 trades=4 positions=1 delai=10m
+python -m simtrade refus                            # journal des refus (--compte, --limite)
 ```
 
 Comptes et sessions :
@@ -116,11 +128,41 @@ Règles de session des comptes automatiques (horaires communs à tous les compte
 - si la cotation a plus de 5 s, la clôture est reportée à la première cotation fraîche (vérification chaque seconde) ;
 - **rattrapage** : si l'API était arrêtée à l'heure de clôture, les positions de la session passée sont vendues à la première cotation fraîche après le redémarrage, au prix du moment. Une clôture faite plus de 5 s après l'heure prévue est de type `cloture_tardive`.
 
+### Garde-fou de risque (comptes automatiques)
+
+Module pur (`risk.py`), appelé avant chaque **entrée** d'un compte automatique : achat au marché, pose d'un achat limite, et déclenchement d'un achat limite. **Les sorties n'y passent jamais.** Stop, objectif, vente au marché, vente limite et clôture de session sont exécutés même si une limite est dépassée. Les comptes manuels ne sont jamais filtrés.
+
+| Règle (code) | Défaut | Détail |
+|---|---|---|
+| `stop_obligatoire` | toujours | toute entrée porte un stop, sous le prix d'entrée |
+| `taille_max` | 20 % | exposition sur la paire après l'entrée (positions au bid + achats limites en attente) ≤ x % de la valeur actuelle du compte |
+| `perte_max_session` | 2 % | perte de la session, réalisée + latente, ≥ x % de la valeur en début de session : plus d'entrée jusqu'à la session suivante, même si le prix remonte |
+| `trades_max_session` | 6 | entrées de la session (achats exécutés + achats limites en attente) |
+| `positions_max` | 2 | paires exposées (position ou achat limite en attente) ; renforcer une paire déjà exposée reste possible |
+| `delai_entrees` | 15 min | entre deux entrées sur la même paire |
+| `prix_perime` | toujours | chaque position et la paire visée ont une cotation de moins de 5 s |
+
+Perte de session, avec $E$ la valeur actuelle du compte au bid, $q_i$ et $C_i$ la quantité et le prix de revient de chaque position :
+
+$$\text{PnL}_s = \sum_{\text{ordres de la session}} \text{pnl\_réalisé} + \sum_i \left(q_i \cdot \text{bid}_i - C_i\right), \qquad E_0 = E - \text{PnL}_s$$
+
+La limite est atteinte si $\text{PnL}_s \le -\,p \cdot E_0$. Un **arrêt de session** est alors enregistré, à la première tentative d'entrée ou par la vérification de l'API (chaque seconde).
+
+Les limites sont **propres à chaque compte** (défauts ci-dessus tant qu'elles ne sont pas modifiées) et recopiées au reset.
+
+**Stop de protection** : chaque entrée d'un compte automatique pose (ou remplace) **le** stop de la paire, sur toute la position, avec un objectif lié facultatif. Pour un achat au marché (`entrer`, `POST /ordres/entree`), l'achat et le stop sont faits dans une seule transaction : si le stop ou l'objectif est invalide, rien n'est acheté. Pour un achat limite, le stop est posé à l'exécution. Si le bid est déjà sous le stop au déclenchement, l'achat est rejeté (`stop_deja_touche`). Sur un compte automatique, ce stop :
+- ne peut pas être **annulé** tant que la position est ouverte (son objectif, si) ;
+- ne se **déplace que vers le haut**, toujours sous le bid ;
+- ne **réserve pas** la quantité : une vente au marché ou limite reste toujours possible, et le stop couvre ce qui reste ;
+- est annulé automatiquement quand la position est fermée.
+
+**Journal** : chaque refus est enregistré, même si l'ordre ne l'est pas, avec la date, le moment, la paire, le montant, le stop, les règles violées, le message et l'état du compte (valeur, perte de session, entrées, exposition). Un achat limite refusé au déclenchement passe à `rejete` (raison `garde_fou:<règles>`).
+
 ### Reset et base de données
 
 `reset` n'efface rien : il **archive** le compte (le compte courant, ou celui donné avec `--compte`) avec ses ordres et ouvre un compte neuf de même nom et de même mode, avec le capital choisi et la date du reset. Les positions ouvertes sont abandonnées, pas vendues, et les ordres en attente annulés. `historique` et `portefeuille` ne montrent qu'un compte à la fois.
 
-**Migration** : la base des étapes 1 à 3 est mise à niveau automatiquement à la première ouverture. Elle est d'abord **sauvegardée** à côté de la base (`simtrade.db.avant-v1-<date>.bak`), puis migrée en une seule transaction. Le nombre de lignes des comptes, positions et ordres et l'intégrité sont vérifiés avant validation. En cas d'échec, tout est annulé, la base reste dans l'ancien format et le message indique la sauvegarde. Le compte actif devient `principal` (manuel), les anciens comptes `archive-<n°>`.
+**Migration** : une base plus ancienne (étapes 1 à 3 : version 0 ; étape 4 : version 1) est mise à niveau automatiquement vers la version 2 à la première ouverture. Elle est d'abord **sauvegardée** à côté de la base (`simtrade.db.avant-v2-<date>.bak`), puis migrée en une seule transaction. La base passe ensuite en mode WAL : la CLI et l'API se bloquent moins entre elles. Le nombre de lignes des comptes, positions et ordres et l'intégrité sont vérifiés avant validation. En cas d'échec, tout est annulé, la base reste dans l'ancien format et le message indique la sauvegarde. Le compte actif devient `principal` (manuel), les anciens comptes `archive-<n°>`.
 
 La base est stockée dans `%LOCALAPPDATA%\simtrade\simtrade.db` (hors du projet et de OneDrive). Pour en utiliser une autre :
 
@@ -141,7 +183,9 @@ Lance un serveur local sur `http://127.0.0.1:8000` (pas accessible depuis le ré
 | GET | `/prix` | | bid, ask, spread, source, heure, âge et `perime` de chaque cotation |
 | POST | `/ordres/achat` | `{"paire": "btc", "montant": "500"}` | ordre exécuté + solde |
 | POST | `/ordres/vente` | `{"paire": "eth", "quantite": "0.05"}` ou `"tout"` | ordre exécuté + solde |
-| POST | `/ordres/limite` | `{"paire": "btc", "sens": "achat", "prix": "78000", "montant": "500"}` (vente : `quantite`) | ordre en attente |
+| POST | `/ordres/entree` | `{"paire": "btc", "montant": "500", "stop": "79000", "objectif": "82000"}` (`objectif` facultatif) | ordre exécuté + solde + `protection` |
+| POST | `/ordres/limite` | `{"paire": "btc", "sens": "achat", "prix": "78000", "montant": "500", "stop": "77000"}` (vente : `quantite` ; `stop` et `objectif` : achat seulement) | ordre en attente |
+| PUT | `/ordres/{n°}/stop` | `{"prix": "79500"}` | stop déplacé |
 | POST | `/ordres/stop`, `/ordres/objectif` | `{"paire": "btc", "prix": "76000", "quantite": "tout"}` (`quantite` facultative) | ordre en attente |
 | POST | `/ordres/stop-objectif` | `{"paire": "sol", "stop": "90", "objectif": "120"}` | les deux ordres liés |
 | GET | `/ordres/attente?tous=false` | | ordres en attente (`tous=true` : aussi exécutés, annulés, rejetés) |
@@ -153,12 +197,16 @@ Lance un serveur local sur `http://127.0.0.1:8000` (pas accessible depuis le ré
 | POST | `/comptes` | `{"nom": "robot", "capital": "2000", "mode": "auto"}` | compte créé |
 | POST | `/comptes/{nom}/choisir`, `/comptes/{nom}/archiver` | | compte |
 | GET, PUT | `/session` | `{"derniere_entree": "23:00", "cloture": "23:55"}` (PUT) | horaires UTC |
-| GET | `/info` | | chemin de la base, compte courant, `comptes_ouverts`, `comptes_archives`, `session`, état des flux (`flux`, `flux_volume`), `historique`, `horloge` |
+| GET, PUT | `/comptes/{nom}/risque` | `{"taille_max_pct": "30", "perte_max_session_pct": "1.5", "entrees_max_session": "4", "positions_max": "1", "delai_entrees": "10m"}` (PUT, champs facultatifs) | limites du garde-fou |
+| GET | `/risque/refus?compte=&limite=100` | | journal des refus, du plus récent au plus ancien |
+| GET | `/info` | | chemin de la base, compte courant, `comptes_ouverts`, `comptes_archives`, `session`, `refus_session`, `boucle` (retard de la boucle asyncio), état des flux (`flux`, `flux_volume`), `historique`, `horloge` |
 | GET | `/bougies/{paire}?intervalle=1m&limite=100` | | bougies OHLC, volume, notional, transactions, `origine`, `complete`, `cloturee`, `qualite` |
 | GET | `/indicateurs/{paire}?intervalle=1m&fenetre=1440&sma=20&ema=20&rsi=14&inclure_courante=false&vwap=jour_utc` | | SMA, EMA, RSI, VWAP, variation, volume, `qualite` |
 | WS | `/ws/prix` | | chaque cotation en direct (d'abord le cache, puis les mises à jour) |
 
 Les routes d'ordres, `/ordres/attente`, `/portefeuille`, `/historique`, `/reset` et `DELETE /ordres/{n°}` acceptent `?compte=<nom ou n°>` (compte courant par défaut).
+
+**Logs et boucle** : les logs de l'API (uvicorn et `simtrade.*`) sont horodatés en UTC à la milliseconde (`2026-10-28 18:01:36.506 UTC WARNING simtrade.hub : …`). Une tâche mesure le retard de la boucle asyncio toutes les 100 ms et écrit un avertissement au-delà de 200 ms (`/info.boucle`). Une boucle bloquée n'envoie plus les pings websocket, et Binance coupe alors la connexion (« keepalive ping timeout »). Toute la base SQLite de l'API passe par un **thread dédié**, pour qu'une attente de verrou (par exemple la CLI qui écrit) ne bloque jamais la boucle.
 
 **Nombres** : envoyés et renvoyés **en chaîne** (`"0.00000001"`, jamais de float ni de `1E-8`). Un nombre JSON (`"montant": 500`) est refusé.
 
@@ -222,7 +270,7 @@ Paramètre invalide (intervalle ou ancrage inconnu, entier ou booléen illisible
 python -m pytest
 ```
 
-Les tests couvrent le moteur (frais, prix moyen, P&L réalisé/latent, performance, refus d'ordres, validation du capital), la persistance (redémarrage, reset, transactions), le parsing des messages Binance/Coinbase, la bascule entre sources, les commandes CLI, les routes de l'API, la reconnexion du flux, le refus des cotations périmées, la construction des bougies, le raccord avec l'historique (klines simulées par `httpx.MockTransport`), les indicateurs (valeurs calculées à la main), la qualité des données et les routes de marché. Pour l'étape 4 : déclenchement et glissement des ordres en attente (dont un stop sauté), exécution par le flux, paires liées, réservations, redémarrage, ordres posés ou annulés par une autre connexion, comptes en parallèle, entrées refusées après l'heure limite, clôture de fin de session, clôture reportée et rattrapage (horloge simulée), migration d'une base des étapes 1 à 3 et annulation complète en cas d'échec. Ils utilisent des données simulées ; une garde dans `tests/conftest.py` fait échouer tout test qui tenterait une résolution de nom ou une connexion hors de la machine.
+Les tests couvrent le moteur (frais, prix moyen, P&L réalisé/latent, performance, refus d'ordres, validation du capital), la persistance (redémarrage, reset, transactions), le parsing des messages Binance/Coinbase, la bascule entre sources, les commandes CLI, les routes de l'API, la reconnexion du flux, le refus des cotations périmées, la construction des bougies, le raccord avec l'historique (klines simulées par `httpx.MockTransport`), les indicateurs (valeurs calculées à la main), la qualité des données et les routes de marché. Pour l'étape 4 : déclenchement et glissement des ordres en attente (dont un stop sauté), exécution par le flux, paires liées, réservations, redémarrage, ordres posés ou annulés par une autre connexion, comptes en parallèle, entrées refusées après l'heure limite, clôture de fin de session, clôture reportée et rattrapage (horloge simulée), migration d'une base des étapes 1 à 3 et annulation complète en cas d'échec. Pour l'étape 5 : chaque règle du garde-fou à la limite exacte, « tout le capital sans stop » refusé et journalisé, entrée + stop atomique, stop qui part après la perte max, clôture de session jamais bloquée, annulation du dernier stop refusée, retard de boucle détecté, aucun accès SQLite depuis l'écouteur de cotations, migration v1 → v2. Ils utilisent des données simulées ; une garde dans `tests/conftest.py` fait échouer tout test qui tenterait une résolution de nom ou une connexion hors de la machine.
 
 ## Architecture
 
@@ -232,8 +280,11 @@ simtrade/
   engine.py    moteur pur : calculs, frais, refus, réservations, validation (aucun I/O)
   orders.py    règles pures des ordres en attente : déclenchement, glissement, refus à la pose
   sessions.py  règles pures des sessions : dernière entrée, clôture, retard
-  storage.py   SQLite : comptes, positions, ordres, ordres en attente, sessions, réglages
+  risk.py      garde-fou pur : limites, état du compte, règles d'entrée
+  storage.py   SQLite : comptes, positions, ordres, ordres en attente, sessions, réglages, limites, refus
   migrations.py  mise à niveau du schéma (sauvegarde, transaction unique, contrôles)
+  dbworker.py  thread SQLite dédié de l'API
+  loopmon.py   logs horodatés en UTC et mesure du retard de la boucle asyncio
   feeds/       sources de prix : Binance, Coinbase, bascule, source simulée
   service.py   TradingService : point d'entrée unique des interfaces
   watcher.py   OrderWatcher (ordres touchés par chaque cotation) et SessionScheduler (clôtures)
@@ -244,7 +295,7 @@ simtrade/
   cli.py       ligne de commande
 ```
 
-L'API ne fait qu'appeler `TradingService`, qui reçoit un `CachedFeed` à la place d'une connexion directe. Dans l'API, `PriceHub` appelle `OrderWatcher` pour **chaque** cotation reçue (sans file d'attente, donc sans cotation sautée) ; le watcher garde les ordres en attente en mémoire et ne touche la base que pour exécuter. Il recharge sa liste après chaque changement fait par le service, et chaque seconde si une autre connexion (la CLI) a écrit dans la base (`PRAGMA data_version`).
+L'API ne fait qu'appeler `TradingService`, qui reçoit un `CachedFeed` à la place d'une connexion directe. Dans l'API, `PriceHub` appelle `OrderWatcher` pour **chaque** cotation reçue (sans file d'attente intermédiaire, donc sans cotation sautée). Le watcher garde les ordres en attente en mémoire ; un ordre touché est mis dans la file (FIFO) du thread SQLite, et la boucle asyncio ne touche jamais la base. Il recharge sa liste après chaque changement fait par le service, et chaque seconde si une autre connexion (la CLI) a écrit dans la base (`PRAGMA data_version`).
 
 ## Limites
 
@@ -256,7 +307,11 @@ L'API ne fait qu'appeler `TradingService`, qui reçoit un `CachedFeed` à la pla
 - **Clôture tardive au prix du moment** (première cotation fraîche), pas à celui de l'heure de clôture.
 - **Repli Coinbase** : les ordres continuent de se déclencher sur le bid/ask Coinbase, dont le spread est plus large ; un stop peut donc partir plus tôt. La source est enregistrée sur chaque ordre.
 - **Déclenchement sur le meilleur bid/ask**, pas sur le dernier prix de transaction comme Binance : un stop peut partir sur un simple écartement du spread.
-- **Pas d'intervention manuelle sur un compte automatique** autre que par les mêmes routes, qui le traitent comme automatique (règles de session comprises).
+- **Pas d'intervention manuelle sur un compte automatique** autre que par les mêmes routes, qui le traitent comme automatique (règles de session et garde-fou compris).
+- **Le garde-fou ne protège que les comptes automatiques.** Un compte manuel peut tout faire, par construction.
+- **Perte de session estimée au bid, hors frais de sortie** : la perte réelle à la vente serait un peu plus forte (0,1 % de frais).
+- **Arrêt de session détecté au mieux chaque seconde** (ou à la tentative d'entrée) : un passage très bref sous la limite, entre deux vérifications et sans tentative d'entrée, peut ne pas être enregistré.
+- **Un stop de protection par paire** : une nouvelle entrée le remplace, y compris par un stop plus bas. Seul son déplacement ultérieur est limité vers le haut.
 - **CLI : une connexion websocket par commande** : chaque commande met 1 à 4 s à obtenir un prix (le temps d'établir la connexion). L'API n'a pas ce délai.
 - **Coinbase en secours est moins liquide en USDT** : le spread BTC-USDT y est nettement plus large que sur Binance (constaté : environ 3,5 pb contre moins de 0,01 pb), et le canal ticker ne se met à jour qu'à chaque transaction.
 - CLI : pas de reconnexion automatique si le flux continu `prix` est coupé en cours de route (l'API, elle, se reconnecte).

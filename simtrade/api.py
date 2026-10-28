@@ -1,7 +1,8 @@
 """API HTTP locale : python -m simtrade api (127.0.0.1:8000).
 
-Toutes les routes sont `async def` : la connexion SQLite, créée dans le lifespan,
-n'est utilisable que depuis le thread de la boucle asyncio.
+Toutes les routes sont `async def`. La connexion SQLite est créée dans un thread dédié
+(DbWorker) et n'est utilisée que depuis lui : chaque route y envoie sa partie base avec
+`svc.run(...)`, si bien qu'un verrou SQLite ne bloque jamais la boucle asyncio.
 Les nombres sortent en chaîne décimale fixe (format(d, "f")), jamais en float.
 """
 
@@ -26,9 +27,12 @@ from simtrade.errors import FeedUnavailable, InvalidCapital, InvalidInput, Order
 from simtrade.feeds.base import PriceFeed
 from simtrade.hub import CachedFeed, PriceHub
 from simtrade.models import LIMIT, MANUAL, STOP, TARGET, Account, Order, PendingOrder, Quote, Side
+from simtrade.dbworker import DbWorker
+from simtrade.loopmon import LoopMonitor, log_config
+from simtrade.risk import RiskLimits
 from simtrade.service import TradeResult, TradingService
 from simtrade.sessions import SessionRules
-from simtrade.storage import Storage
+from simtrade.storage import RefusalRecord, Storage
 from simtrade.watcher import OrderWatcher, SessionScheduler
 
 HOST = "127.0.0.1"
@@ -66,6 +70,36 @@ class LimitBody(BaseModel):
     prix: str
     montant: str | None = None  # achat : montant USDT total, frais inclus
     quantite: str | None = None  # vente : quantité ou "tout"
+    stop: str | None = None  # achat : stop de protection posé à l'exécution (obligatoire sur un compte auto)
+    objectif: str | None = None
+
+
+class EntryBody(BaseModel):
+    paire: str
+    montant: str
+    stop: str
+    objectif: str | None = None
+
+
+class MoveStopBody(BaseModel):
+    prix: str
+
+
+class RiskBody(BaseModel):
+    taille_max_pct: str | None = None
+    perte_max_session_pct: str | None = None
+    entrees_max_session: str | None = None
+    positions_max: str | None = None
+    delai_entrees: str | None = None  # "15m", "900s", "1h" ou minutes
+
+
+RISK_FIELDS = {
+    "taille_max_pct": "taille",
+    "perte_max_session_pct": "perte",
+    "entrees_max_session": "trades",
+    "positions_max": "positions",
+    "delai_entrees": "delai",
+}
 
 
 class StopBody(BaseModel):
@@ -161,11 +195,41 @@ def pending_json(order: PendingOrder) -> dict:
         "montant": opt(order.amount),
         "quantite": "tout" if order.side is Side.SELL and order.quantity is None else opt(order.quantity),
         "lie_a": order.group_id,
+        "protection": order.protection,
+        "stop_attache": opt(order.stop_price),
+        "objectif_attache": opt(order.target_price),
         "statut": order.status,
         "raison": order.reason,
         "cree_le": iso(order.created_at),
         "clos_le": opt_iso(order.closed_at),
         "ordre_execute_id": order.order_id,
+    }
+
+
+def limits_json(limits: RiskLimits) -> dict:
+    return {
+        "taille_max_pct": dec(limits.max_position_pct),
+        "perte_max_session_pct": dec(limits.max_session_loss_pct),
+        "entrees_max_session": limits.max_trades,
+        "positions_max": limits.max_positions,
+        "delai_entrees_s": int(limits.min_entry_gap.total_seconds()),
+        "stop_obligatoire": True,
+    }
+
+
+def refusal_json(r: RefusalRecord) -> dict:
+    return {
+        "id": r.id,
+        "date": iso(r.created_at),
+        "compte_id": r.account_id,
+        "moment": r.moment,
+        "paire": r.pair,
+        "montant": opt(r.amount),
+        "stop": opt(r.stop_price),
+        "ordre_attente_id": r.pending_id,
+        "regles": list(r.rules),
+        "message": r.message,
+        "etat": r.state,
     }
 
 
@@ -260,14 +324,21 @@ def create_app(service: ServiceFactory | None = None, hub: PriceHub | None = Non
     async def lifespan(app: FastAPI):
         price_hub = hub or PriceHub()
         feed = CachedFeed(price_hub)
-        svc = make_service(feed)
+        db = DbWorker()  # la connexion SQLite est créée et utilisée dans ce seul thread
+        svc = await db.run(make_service, feed)
+        svc.db = db
         watcher = OrderWatcher(svc)
-        watcher.load()  # ordres en attente enregistrés avant l'arrêt
+        await svc.run(watcher.load)  # ordres en attente enregistrés avant l'arrêt
         price_hub.listeners.append(watcher.on_quote)
         scheduler = SessionScheduler(svc, watcher)
-        tasks = [asyncio.create_task(price_hub.run()), asyncio.create_task(scheduler.run())]
+        monitor = LoopMonitor()
+        tasks = [
+            asyncio.create_task(price_hub.run()),
+            asyncio.create_task(scheduler.run()),
+            asyncio.create_task(monitor.run()),
+        ]
         app.state.hub, app.state.feed, app.state.service = price_hub, feed, svc
-        app.state.watcher, app.state.scheduler = watcher, scheduler
+        app.state.watcher, app.state.scheduler, app.state.monitor = watcher, scheduler, monitor
         try:
             yield
         finally:
@@ -279,7 +350,8 @@ def create_app(service: ServiceFactory | None = None, hub: PriceHub | None = Non
                 except asyncio.CancelledError:
                     pass
             price_hub.listeners.remove(watcher.on_quote)
-            svc.storage.close()
+            await svc.run(svc.storage.close)
+            db.close()
             await price_hub.aclose()
 
     app = FastAPI(title="Simulateur de paper trading", lifespan=lifespan)
@@ -326,13 +398,21 @@ def create_app(service: ServiceFactory | None = None, hub: PriceHub | None = Non
     async def vente(body: SellBody, request: Request, compte: str | None = None) -> dict:
         return trade_json(await svc_of(request).sell(body.paire, body.quantite, compte=compte))
 
+    @app.post("/ordres/entree")
+    async def entree(body: EntryBody, request: Request, compte: str | None = None) -> dict:
+        svc = svc_of(request)
+        result = await svc.buy(body.paire, body.montant, compte=compte, stop=body.stop, target=body.objectif)
+        protection = await svc.run(svc.storage.protection_orders, result.order.account_id, result.order.pair)
+        return {**trade_json(result), "protection": [pending_json(o) for o in protection]}
+
     # --- Ordres en attente ---
 
     @app.get("/ordres/attente")
     async def ordres_attente(request: Request, compte: str | None = None, tous: bool = False) -> dict:
         svc = svc_of(request)
-        orders = svc.pending_orders(compte=compte, all_statuses=tous)
-        return {"compte": account_json(svc.account(compte)), "ordres": [pending_json(o) for o in orders]}
+        account = await svc.run(svc.account, compte)
+        orders = await svc.run(svc.pending_orders, compte=compte, all_statuses=tous)
+        return {"compte": account_json(account), "ordres": [pending_json(o) for o in orders]}
 
     @app.post("/ordres/limite")
     async def ordre_limite(body: LimitBody, request: Request, compte: str | None = None) -> dict:
@@ -340,8 +420,14 @@ def create_app(service: ServiceFactory | None = None, hub: PriceHub | None = Non
         if size is None:
             champ = "montant" if body.sens.strip().lower() == Side.BUY.value else "quantite"
             raise InvalidInput(f"Champ '{champ}' manquant pour un ordre limite de {body.sens}.")
-        order = await svc_of(request).place_order(body.paire, LIMIT, body.sens, body.prix, size, compte=compte)
+        order = await svc_of(request).place_order(
+            body.paire, LIMIT, body.sens, body.prix, size, compte=compte, stop=body.stop, target=body.objectif
+        )
         return {"ordres": [pending_json(order)]}
+
+    @app.put("/ordres/{numero}/stop")
+    async def deplacer_stop(numero: str, body: MoveStopBody, request: Request, compte: str | None = None) -> dict:
+        return {"ordres": [pending_json(await svc_of(request).move_stop(numero, body.prix, compte=compte))]}
 
     @app.post("/ordres/stop")
     async def ordre_stop(body: StopBody, request: Request, compte: str | None = None) -> dict:
@@ -364,37 +450,65 @@ def create_app(service: ServiceFactory | None = None, hub: PriceHub | None = Non
 
     @app.delete("/ordres/{numero}")
     async def annuler(numero: str, request: Request, compte: str | None = None) -> dict:
-        return {"annules": [pending_json(o) for o in svc_of(request).cancel_order(numero, compte=compte)]}
+        svc = svc_of(request)
+        return {"annules": [pending_json(o) for o in await svc.run(svc.cancel_order, numero, compte=compte)]}
 
     # --- Comptes ---
 
     @app.get("/comptes")
     async def comptes(request: Request, archives: bool = False) -> dict:
         svc = svc_of(request)
-        accounts = svc.accounts() if archives else svc.open_accounts()
+        accounts = await svc.run(svc.accounts if archives else svc.open_accounts)
         return {"comptes": [account_json(a) for a in accounts]}
 
     @app.post("/comptes")
     async def creer_compte(body: AccountBody, request: Request) -> dict:
-        return {"compte": account_json(svc_of(request).create_account(body.nom, body.capital, body.mode))}
+        svc = svc_of(request)
+        return {"compte": account_json(await svc.run(svc.create_account, body.nom, body.capital, body.mode))}
 
     @app.post("/comptes/{nom}/choisir")
     async def choisir_compte(nom: str, request: Request) -> dict:
-        return {"compte": account_json(svc_of(request).select_account(nom))}
+        svc = svc_of(request)
+        return {"compte": account_json(await svc.run(svc.select_account, nom))}
 
     @app.post("/comptes/{nom}/archiver")
     async def archiver_compte(nom: str, request: Request) -> dict:
-        return {"compte": account_json(svc_of(request).archive_account(nom))}
+        svc = svc_of(request)
+        return {"compte": account_json(await svc.run(svc.archive_account, nom))}
+
+    # --- Garde-fou ---
+
+    @app.get("/comptes/{nom}/risque")
+    async def risque(nom: str, request: Request) -> dict:
+        svc = svc_of(request)
+        account, limits = await svc.run(svc.risk_limits, compte=nom)
+        return {"compte": account_json(account), "limites": limits_json(limits)}
+
+    @app.put("/comptes/{nom}/risque")
+    async def regler_risque(nom: str, body: RiskBody, request: Request) -> dict:
+        svc = svc_of(request)
+        changes = {key: value for key, value in body.model_dump().items() if value is not None}
+        account, limits = await svc.run(svc.set_risk_limits, {RISK_FIELDS[k]: v for k, v in changes.items()}, compte=nom)
+        return {"compte": account_json(account), "limites": limits_json(limits)}
+
+    @app.get("/risque/refus")
+    async def refus(
+        request: Request, compte: str | None = None, limite: int = Query(100, ge=1, le=1000)
+    ) -> dict:
+        svc = svc_of(request)
+        return {"refus": [refusal_json(r) for r in await svc.run(svc.refusals, compte=compte, limit=limite)]}
 
     # --- Session ---
 
     @app.get("/session")
     async def session(request: Request) -> dict:
-        return rules_json(svc_of(request).session_rules())
+        svc = svc_of(request)
+        return rules_json(await svc.run(svc.session_rules))
 
     @app.put("/session")
     async def regler_session(body: SessionBody, request: Request) -> dict:
-        return rules_json(svc_of(request).set_session_rules(body.derniere_entree, body.cloture))
+        svc = svc_of(request)
+        return rules_json(await svc.run(svc.set_session_rules, body.derniere_entree, body.cloture))
 
     @app.get("/portefeuille")
     async def portefeuille(request: Request, compte: str | None = None) -> dict:
@@ -424,24 +538,39 @@ def create_app(service: ServiceFactory | None = None, hub: PriceHub | None = Non
 
     @app.get("/historique")
     async def historique(request: Request, compte: str | None = None) -> dict:
-        account, orders = svc_of(request).history(compte=compte)
+        svc = svc_of(request)
+        account, orders = await svc.run(svc.history, compte=compte)
         return {"compte": account_json(account), "ordres": [order_json(o) for o in orders]}
 
     @app.post("/reset")
     async def reset(request: Request, body: ResetBody | None = None, compte: str | None = None) -> dict:
-        account = svc_of(request).reset((body or ResetBody()).capital, compte=compte)
+        svc = svc_of(request)
+        account = await svc.run(svc.reset, (body or ResetBody()).capital, compte=compte)
         return {"compte": account_json(account)}
 
     @app.get("/info")
     async def info(request: Request) -> dict:
         svc = svc_of(request)
         h: PriceHub = request.app.state.hub
+        monitor: LoopMonitor = request.app.state.monitor
+
+        def read() -> tuple:
+            return svc.account(), svc.open_accounts(), svc.accounts(), svc.session_rules(), svc.session_refusals()
+
+        current, opened, accounts, rules, refused = await svc.run(read)
         return {
             "base": svc.storage.path,
-            "compte_actif": account_json(svc.account()),
-            "comptes_ouverts": [a.name for a in svc.open_accounts()],
-            "comptes_archives": sum(1 for a in svc.accounts() if a.archived),
-            "session": rules_json(svc.session_rules()),
+            "compte_actif": account_json(current),
+            "comptes_ouverts": [a.name for a in opened],
+            "comptes_archives": sum(1 for a in accounts if a.archived),
+            "session": rules_json(rules),
+            "refus_session": refused,
+            "boucle": {
+                "retard_max_ms": round(monitor.max_lag * 1000),
+                "dernier_retard_ms": round(monitor.last_lag * 1000),
+                "alertes": monitor.alerts,
+                "seuil_ms": round(monitor.threshold * 1000),
+            },
             "flux": {
                 "source": h.source or h.feed.name,
                 "connecte": h.connected,
@@ -571,4 +700,4 @@ app = create_app()
 def run() -> None:
     import uvicorn
 
-    uvicorn.run(app, host=HOST, port=PORT)
+    uvicorn.run(app, host=HOST, port=PORT, log_config=log_config())

@@ -156,3 +156,8 @@ class PendingOrder:
     closed_at: datetime | None = None
     order_id: int | None = None
     id: int | None = None
+    # Stop de protection d'une position (un par paire) : ne réserve pas la quantité, non annulable
+    # tant que la position d'un compte auto est ouverte. L'objectif lié porte aussi ce drapeau.
+    protection: bool = False
+    stop_price: Decimal | None = None  # achat limite : stop de protection posé à l'exécution
+    target_price: Decimal | None = None  # achat limite : objectif lié posé à l'exécution

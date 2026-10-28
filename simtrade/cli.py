@@ -56,11 +56,34 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("paire")
     p.add_argument("quantite", metavar="quantité", help='quantité de crypto, ou "tout"')
 
+    p = sub.add_parser("entrer", parents=[acc], help="achat au marché + stop de protection (obligatoire en compte auto)")
+    p.add_argument("paire")
+    p.add_argument("montant", help="montant total en USDT, frais inclus")
+    p.add_argument("--stop", required=True, help="prix du stop-loss, sous le bid")
+    p.add_argument("--objectif", help="take-profit lié au stop (facultatif)")
+
     p = sub.add_parser("limite", parents=[acc], help="ordre limite (achat à l'ask <= prix, vente au bid >= prix)")
     p.add_argument("paire")
     p.add_argument("sens", choices=[s.value for s in Side])
     p.add_argument("prix")
     p.add_argument("taille", help='achat : montant USDT frais inclus ; vente : quantité ou "tout"')
+    p.add_argument("--stop", help="achat : stop de protection posé à l'exécution (obligatoire en compte auto)")
+    p.add_argument("--objectif", help="achat : objectif lié au stop, posé à l'exécution")
+
+    p = sub.add_parser("deplacer-stop", parents=[acc], help="déplace un stop (compte auto : seulement vers le haut)")
+    p.add_argument("numero", metavar="n°")
+    p.add_argument("prix")
+
+    p = sub.add_parser("risque", parents=[acc], help="limites du garde-fou du compte (affiche ou modifie)")
+    p.add_argument(
+        "changements",
+        nargs="*",
+        metavar="clé=valeur",
+        help="taille=20 (%%), perte=2 (%%), trades=6, positions=2, delai=15m",
+    )
+
+    p = sub.add_parser("refus", parents=[acc], help="journal des refus du garde-fou (tous les comptes sans --compte)")
+    p.add_argument("--limite", type=int, default=20, help="nombre de refus affichés (défaut 20)")
 
     for name, label in (("stop", "stop-loss : vente au bid quand bid <= prix"), ("objectif", "take-profit : vente au bid quand bid >= prix")):
         p = sub.add_parser(name, parents=[acc], help=label)
@@ -252,18 +275,93 @@ def print_pending(orders: Sequence[PendingOrder]) -> None:
             fmt.usdt(o.amount) if o.amount is not None else ("tout" if o.quantity is None else fmt.qty(o.quantity)),
             str(o.group_id) if o.group_id is not None else "",
             o.status if o.reason is None else f"{o.status} ({o.reason})",
+            "protection" if o.protection else (f"stop {fmt.price(o.stop_price)}" if o.stop_price is not None else ""),
         )
         for o in orders
     ]
-    headers = ["N°", "Posé le", "Type", "Sens", "Paire", "Prix", "Taille", "Lié à", "Statut"]
+    headers = ["N°", "Posé le", "Type", "Sens", "Paire", "Prix", "Taille", "Lié à", "Statut", "Note"]
     print(table(headers, rows, left=5))
 
 
+async def cmd_entrer(service: TradingService, args: argparse.Namespace) -> int:
+    result = await service.buy(args.paire, args.montant, compte=args.compte, stop=args.stop, target=args.objectif)
+    print_trade(service, result)
+    protection = service.storage.protection_orders(result.order.account_id, result.order.pair)
+    print("Protection de la position :")
+    print_pending(protection)
+    print(NO_WATCH)
+    return 0
+
+
 async def cmd_limite(service: TradingService, args: argparse.Namespace) -> int:
-    order = await service.place_order(args.paire, LIMIT, args.sens, args.prix, args.taille, compte=args.compte)
+    order = await service.place_order(
+        args.paire, LIMIT, args.sens, args.prix, args.taille, compte=args.compte, stop=args.stop, target=args.objectif
+    )
     print("Ordre limite posé :")
     print_pending([order])
+    if order.stop_price is not None:
+        target = f", objectif {fmt.price(order.target_price)}" if order.target_price is not None else ""
+        print(f"À l'exécution : stop de protection à {fmt.price(order.stop_price)}{target}.")
     print(NO_WATCH)
+    return 0
+
+
+async def cmd_deplacer_stop(service: TradingService, args: argparse.Namespace) -> int:
+    order = await service.move_stop(args.numero, args.prix, compte=args.compte)
+    print(f"Stop n°{order.id} ({order.pair}) déplacé à {fmt.price(order.trigger_price)}.")
+    return 0
+
+
+def cmd_risque(service: TradingService, args: argparse.Namespace) -> int:
+    if args.changements:
+        changes = {}
+        for item in args.changements:
+            key, sep, value = item.partition("=")
+            if not sep:
+                print(f"Erreur : '{item}' n'est pas de la forme clé=valeur.", file=sys.stderr)
+                return 1
+            changes[key.strip().lower()] = value
+        account, limits = service.set_risk_limits(changes, compte=args.compte)
+        print("Limites enregistrées.")
+    else:
+        account, limits = service.risk_limits(compte=args.compte)
+    gap = int(limits.min_entry_gap.total_seconds())
+    rows = [
+        ("Stop-loss", "obligatoire pour toute entrée"),
+        ("Taille max (taille)", f"{fmt.num(limits.max_position_pct)} % de la valeur du compte par paire"),
+        ("Perte max (perte)", f"{fmt.num(limits.max_session_loss_pct)} % par session (réalisé + latent)"),
+        ("Entrées max (trades)", f"{limits.max_trades} par session"),
+        ("Positions max (positions)", f"{limits.max_positions} paires exposées"),
+        ("Délai entre entrées (delai)", f"{gap // 60} min {gap % 60:02d} s sur une même paire"),
+    ]
+    print(f"Garde-fou du compte '{account.name}' (n°{account.id}, {account.mode})")
+    if account.mode != AUTO:
+        print("(compte manuel : ces limites ne s'appliquent qu'aux comptes automatiques)")
+    width = max(len(k) for k, _ in rows)
+    for key, value in rows:
+        print(f"  {key.ljust(width)}  {value}")
+    return 0
+
+
+def cmd_refus(service: TradingService, args: argparse.Namespace) -> int:
+    records = service.refusals(compte=args.compte, limit=args.limite)
+    if not records:
+        print("Aucun refus du garde-fou.")
+        return 0
+    rows = [
+        (
+            str(r.id),
+            local(r.created_at),
+            str(r.account_id),
+            r.moment,
+            r.pair,
+            fmt.usdt(r.amount) if r.amount is not None else "",
+            ", ".join(r.rules),
+        )
+        for r in records
+    ]
+    print(table(["N°", "Date", "Compte", "Moment", "Paire", "Montant", "Règles"], rows, left=5))
+    print(f"\nDernier refus : {records[0].message}")
     return 0
 
 
@@ -465,7 +563,11 @@ COMMANDS = {
     "vendre": cmd_vendre,
     "portefeuille": cmd_portefeuille,
     "historique": cmd_historique,
+    "entrer": cmd_entrer,
     "limite": cmd_limite,
+    "deplacer-stop": cmd_deplacer_stop,
+    "risque": cmd_risque,
+    "refus": cmd_refus,
     "stop": cmd_stop,
     "objectif": cmd_stop,
     "stop-objectif": cmd_stop_objectif,

@@ -97,7 +97,7 @@ def test_migration_conserve_tout(tmp_path):
 
     s = Storage(path)
     try:
-        assert migrations.version(s.conn) == 1
+        assert migrations.version(s.conn) == migrations.VERSION
         accounts = s.accounts()
         assert [(a.id, a.name, a.mode, a.current) for a in accounts] == [
             (1, "archive-1", MANUAL, False),
@@ -113,7 +113,7 @@ def test_migration_conserve_tout(tmp_path):
         assert s.session_rules().close.strftime("%H:%M") == "23:55"
 
         backup = s.backup_path
-        assert backup is not None and backup.exists() and backup.name.startswith("v0.db.avant-v1-")
+        assert backup is not None and backup.exists() and backup.name.startswith(f"v0.db.avant-v{migrations.VERSION}-")
     finally:
         s.close()
     lines, version = dump(backup)
@@ -135,7 +135,7 @@ def test_deuxieme_ouverture_ne_migre_ni_ne_sauvegarde(tmp_path):
 def test_base_neuve_creee_en_v1_sans_sauvegarde(tmp_path):
     s = Storage(tmp_path / "neuve.db")
     try:
-        assert migrations.version(s.conn) == 1 and s.backup_path is None
+        assert migrations.version(s.conn) == migrations.VERSION and s.backup_path is None
         assert s.active_account().name == "principal"
     finally:
         s.close()
@@ -160,10 +160,10 @@ def test_echec_au_milieu_annule_tout(tmp_path, monkeypatch, bad_step):
         Storage(path)
 
     assert dump(path) == before  # même contenu, toujours en v0
-    assert ".avant-v1-" in str(err.value)
+    assert f".avant-v{migrations.VERSION}-" in str(err.value)
     monkeypatch.undo()
     s = Storage(path)  # nouvel essai sans la panne : la migration passe
     try:
-        assert migrations.version(s.conn) == 1 and len(s.orders(2)) == 1
+        assert migrations.version(s.conn) == migrations.VERSION and len(s.orders(2)) == 1
     finally:
         s.close()

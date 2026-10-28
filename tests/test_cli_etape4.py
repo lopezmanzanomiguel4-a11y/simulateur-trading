@@ -57,7 +57,7 @@ def test_stop_objectif_et_limite(run, capsys):
 def test_comptes_en_parallele(run, capsys):
     assert run("comptes", "creer", "robot", "500", "--auto") == 0
     assert "Compte 'robot' (n°2, auto)" in capsys.readouterr().out
-    assert run("acheter", "sol", "100", "--compte", "robot") == 0
+    assert run("entrer", "sol", "100", "--stop", "90", "--compte", "robot") == 0
     capsys.readouterr()
     assert run("comptes") == 0
     out = capsys.readouterr().out
