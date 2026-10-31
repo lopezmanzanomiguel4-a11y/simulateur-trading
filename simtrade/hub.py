@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import aclosing
@@ -35,6 +36,9 @@ SUBSCRIBER_QUEUE = 100
 RECONCILE_EVERY = 5.0  # secondes entre deux comparaisons avec l'historique
 RECONCILE_GRACE = timedelta(seconds=2)  # délai après la clôture avant de demander la kline définitive
 RECONCILIATIONS_KEPT = 500
+# Chien de garde du flux de cotations : sans aucune cotation pendant ce délai, la connexion est refaite
+# (BTC seul en livre environ 100 par seconde : un silence de 10 s signale une connexion bloquée).
+QUOTE_SILENCE = 10.0
 
 
 @dataclass
@@ -65,6 +69,7 @@ class PriceHub:
         history: HistorySource | None = None,
         clock: Callable[[], datetime] = utcnow,
         reconcile_every: float = RECONCILE_EVERY,
+        quote_silence: float | None = QUOTE_SILENCE,
     ):
         """Sans `feed` : Binance puis Coinbase, avec l'historique Binance. Avec un `feed` fourni,
         l'historique n'est utilisé que si `history` est fourni aussi."""
@@ -81,6 +86,7 @@ class PriceHub:
         self.clock = clock
         self.history = history
         self.reconcile_every = reconcile_every
+        self.quote_silence = quote_silence
         self.market = market if market is not None else MarketData(self.pairs)
         self.quotes: dict[str, Quote] = {}
         self.source: str | None = None
@@ -105,6 +111,13 @@ class PriceHub:
         self._subscribers: set[asyncio.Queue[Quote]] = set()
         # Appelés pour CHAQUE cotation, sans file ni perte (déclenchement des ordres en attente).
         self.listeners: list[Callable[[Quote], object]] = []
+        # Débit et coût du traitement des cotations (exposés dans /info.flux)
+        self.update_max = 0.0  # secondes, durée max de update() (cache, abonnés, écouteurs)
+        self.rate_max = 0  # cotations reçues dans la seconde la plus chargée
+        self.rate_last = 0  # cotations reçues dans la dernière seconde complète
+        self._rate_second: int | None = None
+        self._rate_count = 0
+        self.keepalive_timeouts = 0  # coupures du flux de cotations par « keepalive ping timeout »
 
     @property
     def connected(self) -> bool:
@@ -125,6 +138,20 @@ class PriceHub:
 
     def update(self, quote: Quote) -> None:
         """Met à jour le cache et prévient les abonnés (les plus lents perdent leurs anciennes cotations)."""
+        started = time.perf_counter()
+        second = int(time.monotonic())
+        if second != self._rate_second:
+            if self._rate_second is not None:
+                self.rate_last = self._rate_count if second == self._rate_second + 1 else 0
+                self.rate_max = max(self.rate_max, self._rate_count)
+            self._rate_second, self._rate_count = second, 0
+        self._rate_count += 1
+        try:
+            self._update(quote)
+        finally:
+            self.update_max = max(self.update_max, time.perf_counter() - started)
+
+    def _update(self, quote: Quote) -> None:
         self.quotes[quote.pair] = quote
         self.source = quote.source
         self.last_quote_at = quote.received_at
@@ -171,7 +198,7 @@ class PriceHub:
                 tg.create_task(self.run_history())
 
     async def run_quotes(self) -> None:
-        await self._run_loop(self.feed.stream, self.update, self.status, "de prix")
+        await self._run_loop(self.feed.stream, self.update, self.status, "de prix", silence=self.quote_silence)
 
     async def run_trades(self) -> None:
         await self._run_loop(
@@ -202,8 +229,10 @@ class PriceHub:
         status: LinkStatus,
         label: str,
         on_session: Callable[[], None] | None = None,
+        silence: float | None = None,
     ) -> None:
-        """Se reconnecte avec un délai de 1, 2, 4... max_backoff secondes."""
+        """Se reconnecte avec un délai de 1, 2, 4... max_backoff secondes. Avec `silence` (chien de garde) :
+        une connexion qui a déjà livré mais ne livre plus rien pendant `silence` secondes est coupée."""
         delay = 1.0
         while True:
             received = False
@@ -211,7 +240,16 @@ class PriceHub:
                 on_session()
             try:
                 async with aclosing(open_stream(self.pairs)) as stream:
-                    async for item in stream:
+                    while True:
+                        try:
+                            if received and silence is not None:
+                                item = await asyncio.wait_for(anext(stream), silence)
+                            else:
+                                item = await anext(stream)
+                        except StopAsyncIteration:
+                            break
+                        except TimeoutError:
+                            raise ConnectionError(f"aucune donnée depuis {silence:g} s (chien de garde)") from None
                         received = True
                         status.connected = True
                         on_item(item)
@@ -221,6 +259,8 @@ class PriceHub:
                 raise
             except Exception as exc:  # réseau, toutes les sources injoignables...
                 status.last_error = str(exc) or type(exc).__name__
+                if status is self.status and "keepalive ping timeout" in status.last_error:
+                    self.keepalive_timeouts += 1
             status.connected = False
             if received:
                 delay = 1.0

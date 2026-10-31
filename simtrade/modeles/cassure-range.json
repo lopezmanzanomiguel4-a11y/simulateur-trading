@@ -1,0 +1,17 @@
+{
+  "nom": "cassure-range",
+  "paire": "BTCUSDT",
+  "intervalle": "5m",
+  "entree": [
+    {"brique": "cassure_range", "debut": "00:00", "minutes": 30},
+    {"brique": "volatilite", "n": 14, "min_pct": "0.10", "max_pct": "1.50"}
+  ],
+  "sortie": [
+    {"brique": "retour_dans_range"},
+    {"brique": "duree_max", "bougies": 24}
+  ],
+  "stop": {"type": "range", "marge_pct": "0.05"},
+  "objectif": {"type": "r", "multiple": "1.5"},
+  "taille": {"pct_capital": "10"},
+  "heures_actives": {"debut": "00:30", "fin": "22:00"}
+}

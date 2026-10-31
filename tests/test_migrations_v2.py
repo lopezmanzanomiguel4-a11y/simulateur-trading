@@ -38,8 +38,8 @@ def test_v1_vers_v2(tmp_path, monkeypatch):
     before = rows(path, "SELECT * FROM orders ORDER BY id"), rows(path, "SELECT * FROM pending_orders")
     s = Storage(path)
     try:
-        assert migrations.version(s.conn) == 2
-        assert s.backup_path.name.startswith("v1.db.avant-v2-")
+        assert migrations.version(s.conn) == migrations.VERSION
+        assert s.backup_path.name.startswith(f"v1.db.avant-v{migrations.VERSION}-")
         assert rows(path, "SELECT * FROM orders ORDER BY id") == before[0]
         (pending,) = s.pending_orders()
         assert (pending.pair, pending.protection, pending.stop_price) == ("ETHUSDT", False, None)
@@ -56,7 +56,7 @@ def test_v0_vers_v2_en_une_ouverture(tmp_path):
     make_v0(path)
     s = Storage(path)
     try:
-        assert migrations.version(s.conn) == 2 and s.backup_path.name.startswith("v0.db.avant-v2-")
+        assert migrations.version(s.conn) == migrations.VERSION and s.backup_path.name.startswith(f"v0.db.avant-v{migrations.VERSION}-")
         assert [a.name for a in s.accounts()] == ["archive-1", "principal"]
     finally:
         s.close()
@@ -66,7 +66,7 @@ def test_echec_v1_vers_v2_laisse_la_base_en_v1(tmp_path, monkeypatch):
     path = make_v1(tmp_path, monkeypatch)
     before = dump(path)
     monkeypatch.setattr(migrations, "V2_STEPS", migrations.V2_STEPS[:3] + ["CREATE TABLE accounts (x)"] + migrations.V2_STEPS[3:])
-    with pytest.raises(MigrationError, match="La base n'a pas été modifiée. Sauvegarde : .*avant-v2-"):
+    with pytest.raises(MigrationError, match=f"La base n'a pas été modifiée. Sauvegarde : .*avant-v{migrations.VERSION}-"):
         Storage(path)
     assert dump(path) == before
 

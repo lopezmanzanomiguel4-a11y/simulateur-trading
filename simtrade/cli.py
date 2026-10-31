@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import sys
 import time
 from collections.abc import Sequence
 from datetime import datetime
+from pathlib import Path
 
-from simtrade import fmt
+from simtrade import fmt, strategies
 from simtrade.config import DB_ENV_VAR, db_path
 from simtrade.engine import DEFAULT_CAPITAL, FEE_RATE, validate_capital
 from simtrade.errors import SimTradeError
@@ -84,6 +86,20 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("refus", parents=[acc], help="journal des refus du garde-fou (tous les comptes sans --compte)")
     p.add_argument("--limite", type=int, default=20, help="nombre de refus affichés (défaut 20)")
+
+    sub.add_parser("strategies", help="modèles de stratégie et bornes de leurs paramètres")
+
+    p = sub.add_parser("strategie", parents=[acc], help="stratégie active du compte (affiche, active, désactive)")
+    actions = p.add_subparsers(dest="action", metavar="action")
+    q = actions.add_parser("activer", parents=[acc], help="active un modèle (remplace la stratégie active)")
+    q.add_argument("modele", metavar="modèle", nargs="?", help="nom du modèle (voir : strategies)")
+    q.add_argument("changements", nargs="*", metavar="clé=valeur", help="ex. stop.multiple=2 rsi_extreme.seuil=35")
+    q.add_argument("--fichier", help="définition complète en JSON (à la place d'un modèle)")
+    actions.add_parser("desactiver", parents=[acc], help="désactive la stratégie (la position garde son stop)")
+
+    p = sub.add_parser("signaux", parents=[acc], help="journal des signaux des stratégies (tous les comptes sans --compte)")
+    p.add_argument("--limite", type=int, default=20, help="nombre de signaux affichés (défaut 20)")
+    p.add_argument("--decision", choices=["ordre", "refuse", "ignore"], help="filtre sur la décision")
 
     for name, label in (("stop", "stop-loss : vente au bid quand bid <= prix"), ("objectif", "take-profit : vente au bid quand bid >= prix")):
         p = sub.add_parser(name, parents=[acc], help=label)
@@ -365,6 +381,89 @@ def cmd_refus(service: TradingService, args: argparse.Namespace) -> int:
     return 0
 
 
+def parse_changes(items: Sequence[str]) -> dict[str, str] | None:
+    changes = {}
+    for item in items:
+        key, sep, value = item.partition("=")
+        if not sep:
+            print(f"Erreur : '{item}' n'est pas de la forme clé=valeur.", file=sys.stderr)
+            return None
+        changes[key.strip()] = value.strip()
+    return changes
+
+
+def cmd_strategies(service: TradingService, args: argparse.Namespace) -> int:
+    for name, raw in strategies.models().items():
+        s = strategies.validate(raw)
+        entry = " ET ".join(b.name for b in s.entree)
+        exits = " OU ".join(b.name for b in s.sortie) or "aucune"
+        print(f"{name} : {s.paire} {s.intervalle}, entrée {entry} ; sortie {exits} ; "
+              f"stop {s.stop.name}, objectif {s.objectif.name}, {fmt.num(s.taille_pct)} % du capital, "
+              f"{s.debut:%H:%M}-{s.fin:%H:%M} UTC")
+    print("\nParamètres (type, bornes, défaut) :")
+    print(json.dumps(strategies.schema(), ensure_ascii=False, indent=1))
+    return 0
+
+
+def print_strategy(s: strategies.Strategy) -> None:
+    print(json.dumps(s.to_json(), ensure_ascii=False, indent=1))
+
+
+def cmd_strategie(service: TradingService, args: argparse.Namespace) -> int:
+    if args.action == "activer":
+        changes = parse_changes(args.changements)
+        if changes is None:
+            return 1
+        definition = None
+        if args.fichier:
+            definition = json.loads(Path(args.fichier).read_text(encoding="utf-8"))
+        account, _, strategy = service.activate_strategy(
+            compte=args.compte, modele=args.modele, parametres=changes, definition=definition
+        )
+        print(f"Stratégie '{strategy.nom}' activée sur le compte '{account.name}' (exécutée quand l'API tourne) :")
+        print_strategy(strategy)
+        return 0
+    if args.action == "desactiver":
+        account, record = service.deactivate_strategy(compte=args.compte)
+        if record is None:
+            print(f"Aucune stratégie active sur le compte '{account.name}'.")
+        else:
+            print(f"Stratégie '{record.name}' désactivée sur le compte '{account.name}'. "
+                  "Une position ouverte garde son stop, son objectif et la clôture de session.")
+        return 0
+    account, record = service.active_strategy(compte=args.compte)
+    if record is None:
+        print(f"Aucune stratégie active sur le compte '{account.name}'.")
+        return 0
+    print(f"Compte '{account.name}' : stratégie '{record.name}' active depuis le {local(record.activated_at)}")
+    print_strategy(strategies.loads(record.definition))
+    return 0
+
+
+def cmd_signaux(service: TradingService, args: argparse.Namespace) -> int:
+    records = service.signals(compte=args.compte, decision=args.decision, limit=args.limite)
+    if not records:
+        print("Aucun signal.")
+        return 0
+    rows = [
+        (
+            str(r.id),
+            local(r.created_at),
+            str(r.account_id),
+            r.pair,
+            r.interval,
+            local(r.candle_open_time),
+            r.kind,
+            r.decision,
+            str(r.order_id or ""),
+            ", ".join(r.reasons),
+        )
+        for r in records
+    ]
+    print(table(["N°", "Date", "Compte", "Paire", "Int.", "Bougie", "Type", "Décision", "Ordre", "Raisons"], rows, left=10))
+    return 0
+
+
 async def cmd_stop(service: TradingService, args: argparse.Namespace) -> int:
     kind = STOP if args.command == "stop" else TARGET
     order = await service.place_order(args.paire, kind, Side.SELL, args.prix, args.quantite, compte=args.compte)
@@ -568,6 +667,9 @@ COMMANDS = {
     "deplacer-stop": cmd_deplacer_stop,
     "risque": cmd_risque,
     "refus": cmd_refus,
+    "strategies": cmd_strategies,
+    "strategie": cmd_strategie,
+    "signaux": cmd_signaux,
     "stop": cmd_stop,
     "objectif": cmd_stop,
     "stop-objectif": cmd_stop_objectif,

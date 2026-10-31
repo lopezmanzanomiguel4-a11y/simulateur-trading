@@ -1,0 +1,17 @@
+{
+  "nom": "tendance-ema",
+  "paire": "BTCUSDT",
+  "intervalle": "5m",
+  "entree": [
+    {"brique": "croisement_ema", "sens": "haussier", "rapide": 9, "lente": 21},
+    {"brique": "au_dessus_vwap"},
+    {"brique": "volatilite", "n": 14, "min_pct": "0.15", "max_pct": "2"}
+  ],
+  "sortie": [
+    {"brique": "croisement_ema", "sens": "baissier", "rapide": 9, "lente": 21}
+  ],
+  "stop": {"type": "atr", "multiple": "2", "n": 14},
+  "objectif": {"type": "r", "multiple": "2"},
+  "taille": {"pct_capital": "10"},
+  "heures_actives": {"debut": "06:00", "fin": "22:00"}
+}

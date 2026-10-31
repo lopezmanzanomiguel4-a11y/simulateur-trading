@@ -30,9 +30,11 @@ from simtrade.models import LIMIT, MANUAL, STOP, TARGET, Account, Order, Pending
 from simtrade.dbworker import DbWorker
 from simtrade.loopmon import LoopMonitor, log_config
 from simtrade.risk import RiskLimits
+from simtrade.runner import RunnerState, StrategyRunner
+from simtrade import strategies
 from simtrade.service import TradeResult, TradingService
 from simtrade.sessions import SessionRules
-from simtrade.storage import RefusalRecord, Storage
+from simtrade.storage import ActivationRecord, RefusalRecord, SignalRecord, Storage
 from simtrade.watcher import OrderWatcher, SessionScheduler
 
 HOST = "127.0.0.1"
@@ -124,6 +126,12 @@ class AccountBody(BaseModel):
 class SessionBody(BaseModel):
     derniere_entree: str
     cloture: str
+
+
+class StrategyBody(BaseModel):
+    modele: str | None = None  # nom d'un modèle de GET /strategies
+    parametres: dict[str, str | int] | None = None  # surcharges "cle": "valeur" (ex. "stop.multiple": "2")
+    definition: dict | None = None  # ou définition complète
 
 
 # --- Sérialisation ---
@@ -233,6 +241,53 @@ def refusal_json(r: RefusalRecord) -> dict:
     }
 
 
+def activation_json(a: ActivationRecord | None) -> dict | None:
+    if a is None:
+        return None
+    return {
+        "id": a.id,
+        "compte_id": a.account_id,
+        "nom": a.name,
+        "definition": strategies.loads(a.definition).to_json(),
+        "activee_le": iso(a.activated_at),
+        "desactivee_le": opt_iso(a.deactivated_at),
+        "raison": a.reason,
+    }
+
+
+def runner_state_json(state: RunnerState | None) -> dict | None:
+    if state is None:
+        return None
+    return {
+        "strategie": state.strategy,
+        "derniere_bougie": opt_iso(state.candle),
+        "evaluee_le": opt_iso(state.evaluated_at),
+        "entree": state.entry,
+        "sortie": state.exit,
+        "decision": state.decision,
+        "raisons": list(state.reasons),
+        "valeurs": state.values,
+    }
+
+
+def signal_json(s: SignalRecord) -> dict:
+    return {
+        "id": s.id,
+        "date": iso(s.created_at),
+        "compte_id": s.account_id,
+        "activation_id": s.activation_id,
+        "paire": s.pair,
+        "intervalle": s.interval,
+        "bougie": iso(s.candle_open_time),
+        "type": s.kind,
+        "decision": s.decision,
+        "raisons": list(s.reasons),
+        "ordre_id": s.order_id,
+        "refus_id": s.refusal_id,
+        "details": s.details,
+    }
+
+
 def rules_json(rules: SessionRules) -> dict:
     return {"derniere_entree": f"{rules.last_entry:%H:%M}", "cloture": f"{rules.close:%H:%M}", "fuseau": "UTC"}
 
@@ -332,13 +387,16 @@ def create_app(service: ServiceFactory | None = None, hub: PriceHub | None = Non
         price_hub.listeners.append(watcher.on_quote)
         scheduler = SessionScheduler(svc, watcher)
         monitor = LoopMonitor()
+        runner = StrategyRunner(svc, price_hub)
         tasks = [
             asyncio.create_task(price_hub.run()),
             asyncio.create_task(scheduler.run()),
             asyncio.create_task(monitor.run()),
+            asyncio.create_task(runner.run()),
         ]
         app.state.hub, app.state.feed, app.state.service = price_hub, feed, svc
         app.state.watcher, app.state.scheduler, app.state.monitor = watcher, scheduler, monitor
+        app.state.runner = runner
         try:
             yield
         finally:
@@ -498,6 +556,55 @@ def create_app(service: ServiceFactory | None = None, hub: PriceHub | None = Non
         svc = svc_of(request)
         return {"refus": [refusal_json(r) for r in await svc.run(svc.refusals, compte=compte, limit=limite)]}
 
+    # --- Stratégies ---
+
+    @app.get("/strategies")
+    async def liste_strategies() -> dict:
+        return {
+            "modeles": [strategies.validate(raw).to_json() for raw in strategies.models().values()],
+            "schema": strategies.schema(),
+        }
+
+    def runner_state(request: Request, account_id: int) -> dict | None:
+        runner: StrategyRunner | None = getattr(request.app.state, "runner", None)
+        return runner_state_json(runner.states.get(account_id)) if runner is not None else None
+
+    @app.get("/comptes/{nom}/strategie")
+    async def strategie(nom: str, request: Request) -> dict:
+        svc = svc_of(request)
+        account, active = await svc.run(svc.active_strategy, compte=nom)
+        return {
+            "compte": account_json(account),
+            "strategie": activation_json(active),
+            "etat": runner_state(request, account.id) if active else None,
+        }
+
+    @app.put("/comptes/{nom}/strategie")
+    async def activer_strategie(nom: str, body: StrategyBody, request: Request) -> dict:
+        svc = svc_of(request)
+        params = {k: str(v) for k, v in (body.parametres or {}).items()}
+        account, record, _ = await svc.run(
+            svc.activate_strategy, compte=nom, modele=body.modele, parametres=params, definition=body.definition
+        )
+        return {"compte": account_json(account), "strategie": activation_json(record)}
+
+    @app.delete("/comptes/{nom}/strategie")
+    async def desactiver_strategie(nom: str, request: Request) -> dict:
+        svc = svc_of(request)
+        account, record = await svc.run(svc.deactivate_strategy, compte=nom)
+        return {"compte": account_json(account), "desactivee": activation_json(record)}
+
+    @app.get("/signaux")
+    async def signaux(
+        request: Request,
+        compte: str | None = None,
+        decision: str | None = None,
+        limite: int = Query(100, ge=1, le=1000),
+    ) -> dict:
+        svc = svc_of(request)
+        found = await svc.run(svc.signals, compte=compte, decision=decision, limit=limite)
+        return {"signaux": [signal_json(s) for s in found]}
+
     # --- Session ---
 
     @app.get("/session")
@@ -554,10 +661,15 @@ def create_app(service: ServiceFactory | None = None, hub: PriceHub | None = Non
         h: PriceHub = request.app.state.hub
         monitor: LoopMonitor = request.app.state.monitor
 
-        def read() -> tuple:
-            return svc.account(), svc.open_accounts(), svc.accounts(), svc.session_rules(), svc.session_refusals()
+        runner: StrategyRunner | None = getattr(request.app.state, "runner", None)
 
-        current, opened, accounts, rules, refused = await svc.run(read)
+        def read() -> tuple:
+            return (
+                svc.account(), svc.open_accounts(), svc.accounts(), svc.session_rules(), svc.session_refusals(),
+                svc.active_strategies(),
+            )
+
+        current, opened, accounts, rules, refused, actives = await svc.run(read)
         return {
             "base": svc.storage.path,
             "compte_actif": account_json(current),
@@ -565,6 +677,11 @@ def create_app(service: ServiceFactory | None = None, hub: PriceHub | None = Non
             "comptes_archives": sum(1 for a in accounts if a.archived),
             "session": rules_json(rules),
             "refus_session": refused,
+            "strategies": {
+                "actives": [{"compte_id": a.account_id, "nom": a.name} for a in actives],
+                "evaluations": runner.evaluations if runner else 0,
+                "evaluation_max_ms": round(runner.max_eval_ms, 2) if runner else 0,
+            },
             "boucle": {
                 "retard_max_ms": round(monitor.max_lag * 1000),
                 "dernier_retard_ms": round(monitor.last_lag * 1000),
@@ -577,6 +694,15 @@ def create_app(service: ServiceFactory | None = None, hub: PriceHub | None = Non
                 "derniere_cotation": iso(h.last_quote_at) if h.last_quote_at else None,
                 "derniere_erreur": h.last_error,
                 "reconnexions": h.reconnects,
+                "coupures_keepalive": h.keepalive_timeouts,
+                "debit_par_s": h.rate_last,
+                "debit_max_par_s": h.rate_max,
+                "retard_traitement_max_ms": round(h.update_max * 1000, 3),
+                "file_reception": {
+                    f.name: {"max": f.stats.queue_max, "pauses": f.stats.pauses}
+                    for f in getattr(h.feed, "feeds", [h.feed])
+                    if getattr(f, "stats", None) is not None
+                },
             },
             "flux_volume": {
                 "actif": h.feed.has_trades,

@@ -3,6 +3,7 @@
 v0 : étapes 1 à 3 (un seul compte actif, ordres au marché).
 v1 : étape 4 (comptes nommés manuel/auto en parallèle, ordres en attente, sessions, réglages).
 v2 : étape 5 (garde-fou : stops de protection, limites par compte, journal des refus, arrêts de session).
+v3 : étape 6 (stratégies activées sur les comptes auto, journal des signaux).
 
 Une base existante est d'abord sauvegardée (sqlite3 backup, cohérent même base ouverte), puis
 migrée jusqu'à la dernière version dans UNE transaction : en cas d'échec, ROLLBACK complet et
@@ -19,7 +20,7 @@ from simtrade.errors import SimTradeError
 from simtrade.models import utcnow
 from simtrade.sessions import DEFAULT_CLOSE, DEFAULT_LAST_ENTRY
 
-VERSION = 2
+VERSION = 3
 
 V1_STEPS: list[str] = [
     "ALTER TABLE accounts ADD COLUMN name TEXT NOT NULL DEFAULT ''",
@@ -99,6 +100,38 @@ V2_STEPS: list[str] = [
         reason     TEXT    NOT NULL
     )""",
     "CREATE INDEX session_halts_by_account ON session_halts(account_id, date)",
+]
+
+V3_STEPS: list[str] = [
+    """CREATE TABLE strategy_activations (
+        id             INTEGER PRIMARY KEY,
+        account_id     INTEGER NOT NULL REFERENCES accounts(id),
+        name           TEXT    NOT NULL,
+        definition     TEXT    NOT NULL,
+        activated_at   TEXT    NOT NULL,
+        deactivated_at TEXT,
+        reason         TEXT
+    )""",
+    # Une seule stratégie active par compte.
+    "CREATE UNIQUE INDEX one_active_strategy ON strategy_activations(account_id) WHERE deactivated_at IS NULL",
+    """CREATE TABLE signals (
+        id               INTEGER PRIMARY KEY,
+        account_id       INTEGER NOT NULL REFERENCES accounts(id),
+        activation_id    INTEGER NOT NULL REFERENCES strategy_activations(id),
+        pair             TEXT    NOT NULL,
+        interval         TEXT    NOT NULL,
+        candle_open_time TEXT    NOT NULL,
+        kind             TEXT    NOT NULL,
+        created_at       TEXT    NOT NULL,
+        decision         TEXT    NOT NULL,
+        reasons          TEXT    NOT NULL,
+        order_id         INTEGER REFERENCES orders(id),
+        refusal_id       INTEGER REFERENCES risk_refusals(id),
+        details          TEXT    NOT NULL
+    )""",
+    # Au plus une décision par stratégie, par bougie et par type : dédoublonnage persistant.
+    "CREATE UNIQUE INDEX one_signal_per_candle ON signals(activation_id, candle_open_time, kind)",
+    "CREATE INDEX signals_by_account ON signals(account_id, id)",
 ]
 
 KEPT_TABLES = ("accounts", "positions", "orders")

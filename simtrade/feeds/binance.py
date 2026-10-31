@@ -8,10 +8,13 @@ from datetime import timedelta
 
 from websockets.asyncio.client import connect
 
-from simtrade.feeds.base import PriceFeed
+from simtrade.feeds.base import FlowStats, PriceFeed
 from simtrade.models import EPOCH, Quote, Trade, clean_decimal, utcnow
 
 BINANCE_URL = "wss://stream.binance.com:443/stream?streams="
+# Trames en attente avant que websockets ne suspende la lecture du socket (défaut 16). Mesuré sur
+# 15 min : rafales de 540 trames en une lecture TCP, d'où 1 389 pauses (8 ms max). 1024 les absorbe.
+MAX_QUEUE = 1024
 
 
 def parse_message(raw: str | bytes) -> Quote | None:
@@ -53,13 +56,15 @@ class BinanceFeed(PriceFeed):
     def __init__(self, base_url: str = BINANCE_URL, open_timeout: float = 5.0):
         self.base_url = base_url
         self.open_timeout = open_timeout
+        self.stats = FlowStats()  # file de réception des cotations
 
     async def stream(self, pairs: Sequence[str]) -> AsyncIterator[Quote]:
         streams = "/".join(f"{p.lower()}@bookTicker" for p in pairs)
         # Binance ne répond pas à la trame de fermeture : sans close_timeout court, chaque
         # déconnexion attend 10 s.
-        async with connect(self.base_url + streams, open_timeout=self.open_timeout, close_timeout=0.2) as ws:
+        async with connect(self.base_url + streams, open_timeout=self.open_timeout, close_timeout=0.2, max_queue=MAX_QUEUE) as ws:
             async for raw in ws:
+                self.stats.sample(ws)
                 quote = parse_message(raw)
                 if quote is not None:
                     yield quote
@@ -67,7 +72,7 @@ class BinanceFeed(PriceFeed):
     async def trades(self, pairs: Sequence[str]) -> AsyncIterator[Trade]:
         # Connexion distincte de celle des cotations : une coupure de l'une ne touche pas l'autre.
         streams = "/".join(f"{p.lower()}@aggTrade" for p in pairs)
-        async with connect(self.base_url + streams, open_timeout=self.open_timeout, close_timeout=0.2) as ws:
+        async with connect(self.base_url + streams, open_timeout=self.open_timeout, close_timeout=0.2, max_queue=MAX_QUEUE) as ws:
             async for raw in ws:
                 trade = parse_trade(raw)
                 if trade is not None:

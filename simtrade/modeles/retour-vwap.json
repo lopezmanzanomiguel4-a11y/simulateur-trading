@@ -1,0 +1,18 @@
+{
+  "nom": "retour-vwap",
+  "paire": "BTCUSDT",
+  "intervalle": "5m",
+  "entree": [
+    {"brique": "ecart_vwap", "cote": "sous", "seuil_pct": "0.6"},
+    {"brique": "rsi_extreme", "zone": "bas", "n": 14, "seuil": "30"},
+    {"brique": "volatilite", "n": 14, "min_pct": "0.10", "max_pct": "1.20"}
+  ],
+  "sortie": [
+    {"brique": "retour_vwap"},
+    {"brique": "duree_max", "bougies": 12}
+  ],
+  "stop": {"type": "atr", "multiple": "1.5", "n": 14},
+  "objectif": {"type": "r", "multiple": "2"},
+  "taille": {"pct_capital": "10"},
+  "heures_actives": {"debut": "06:00", "fin": "22:00"}
+}

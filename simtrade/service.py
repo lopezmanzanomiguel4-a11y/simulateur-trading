@@ -10,19 +10,25 @@ synchrones avec `run()` aussi. Sans `db` (CLI, tests), `run()` appelle directeme
 
 Garde-fou (risk.py) : appelé avant chaque ENTRÉE d'un compte automatique (achat au marché,
 pose et déclenchement d'un achat limite). Les sorties n'y passent jamais.
+
+Stratégies (strategies.py) : au plus une stratégie active par compte automatique. Les signaux
+produits par StrategyRunner sont traités ici : une décision par stratégie, par bougie et par type,
+enregistrée dans la MÊME transaction que l'ordre (dédoublonnage persistant après redémarrage).
 """
 
 from __future__ import annotations
 
 import logging
+import sqlite3
 from collections.abc import AsyncIterator, Callable, Iterable, Sequence
 from dataclasses import dataclass, replace
 from datetime import date, datetime
-from decimal import Decimal
+from decimal import ROUND_DOWN, Decimal
 from typing import Any, TypeVar
 
 from simtrade import fmt
 from simtrade import orders as rules_orders
+from simtrade import strategies
 from simtrade.dbworker import DbWorker
 from simtrade.engine import DEFAULT_CAPITAL, Portfolio, Valuation, normalize_pair
 from simtrade.errors import FeedUnavailable, InvalidInput, OrderRejected
@@ -62,17 +68,37 @@ from simtrade.risk import (
     update_limits,
 )
 from simtrade.sessions import SessionRules, close_due, entry_allowed, is_late, session_date, validate_rules
-from simtrade.storage import RefusalRecord, Storage
+from simtrade.storage import ActivationRecord, RefusalRecord, SignalRecord, Storage
+from simtrade.strategies import Plan, Strategy
 
 log = logging.getLogger("simtrade.service")
 
 T = TypeVar("T")
+
+# Signaux : types et décisions
+ENTRY = "entree"
+EXIT = "sortie"
+ORDER = "ordre"
+REFUSED = "refuse"
+IGNORED = "ignore"
+DECISIONS = (ORDER, REFUSED, IGNORED)
+IMPOSSIBLE = "ordre_impossible"  # ordre rejeté hors garde-fou (solde, session, prix...)
 
 
 @dataclass(frozen=True)
 class TradeResult:
     order: Order
     cash: Decimal  # solde USDT après l'ordre
+
+
+@dataclass(frozen=True)
+class StrategyContext:
+    """Ce que la stratégie doit savoir du compte pour décider."""
+
+    has_position: bool
+    entered_at: datetime | None  # dernier achat de la position en cours
+    halted: bool  # arrêt de session (perte max) déjà enregistré
+    rules: SessionRules
 
 
 @dataclass(frozen=True)
@@ -172,28 +198,42 @@ class TradingService:
         target: Decimal | None,
         quotes: dict[str, Quote],
     ) -> TradeResult:
-        quote = quotes[pair]
-        now = self.clock()
         try:
-            with self.storage.transaction():
-                account = self.storage.account(compte)
-                self._check_entry(account)
-                portfolio = self._open_portfolio(account.id)
-                amount = portfolio.check_buy(amount_usdt)
-                if account.mode == AUTO:
-                    request = EntryRequest(pair, amount, quote.ask, stop, MARKET_ENTRY, now, bid=quote.bid)
-                    self._guard(account, request, quotes)
-                if stop is not None:
-                    self._check_protection(pair, stop, target, quote)
-                order = portfolio.buy(quote, amount, now)
-                saved = self.storage.save_trade(portfolio, order)
-                if stop is not None:
-                    self._set_protection(account, pair, stop, target, now)
+            result = self._buy_unlogged(compte, pair, amount_usdt, stop, target, quotes)
         except RiskRefused as exc:
             self._log_refusal(exc.record)
             raise
         if stop is not None:
             self._notify()
+        return result
+
+    def _buy_unlogged(
+        self,
+        compte: object,
+        pair: str,
+        amount_usdt: object,
+        stop: Decimal | None,
+        target: Decimal | None,
+        quotes: dict[str, Quote],
+    ) -> TradeResult:
+        """Achat (+ stop de protection) dans une transaction, ou dans celle de l'appelant s'il en a ouvert une.
+        Un refus du garde-fou est levé SANS être journalisé : à l'appelant de l'écrire après le ROLLBACK."""
+        quote = quotes[pair]
+        now = self.clock()
+        with self.storage.transaction():
+            account = self.storage.account(compte)
+            self._check_entry(account)
+            portfolio = self._open_portfolio(account.id)
+            amount = portfolio.check_buy(amount_usdt)
+            if account.mode == AUTO:
+                request = EntryRequest(pair, amount, quote.ask, stop, MARKET_ENTRY, now, bid=quote.bid)
+                self._guard(account, request, quotes)
+            if stop is not None:
+                self._check_protection(pair, stop, target, quote)
+            order = portfolio.buy(quote, amount, now)
+            saved = self.storage.save_trade(portfolio, order)
+            if stop is not None:
+                self._set_protection(account, pair, stop, target, now)
         return TradeResult(saved, portfolio.account.cash)
 
     async def sell(self, pair: str, quantity: object, *, compte: object = None) -> TradeResult:
@@ -302,13 +342,14 @@ class TradingService:
         )
         raise exc
 
-    def _log_refusal(self, record: RefusalRecord) -> None:
+    def _log_refusal(self, record: RefusalRecord) -> RefusalRecord:
         """Journal des refus (et arrêt de session si perte max) : transaction à part, validée même si l'ordre ne l'est pas."""
         with self.storage.transaction():
-            self.storage.add_refusal(record)
+            saved = self.storage.add_refusal(record)
             if MAX_LOSS in record.rules:
                 self.storage.halt_session(record.account_id, session_date(record.created_at), record.created_at, MAX_LOSS)
         log.warning("Garde-fou, compte n°%s : %s", record.account_id, record.message)
+        return saved
 
     def risk_limits(self, *, compte: object = None) -> tuple[Account, RiskLimits]:
         account = self.storage.account(compte, open_only=False)
@@ -775,6 +816,203 @@ class TradingService:
             if opened is not None:
                 due.append((account, opened))
         return due
+
+    # --- Stratégies ---
+
+    def activate_strategy(
+        self,
+        *,
+        compte: object = None,
+        modele: str | None = None,
+        parametres: dict[str, object] | None = None,
+        definition: object = None,
+    ) -> tuple[Account, ActivationRecord, Strategy]:
+        """Active un modèle (avec surcharges 'cle=valeur') ou une définition complète sur un compte auto.
+        La stratégie déjà active sur le compte est remplacée."""
+        if (modele is None) == (definition is None):
+            raise InvalidInput("Donne soit un modèle, soit une définition complète de stratégie.")
+        raw = strategies.model(modele) if modele is not None else definition
+        if parametres:
+            raw = strategies.with_overrides(raw, parametres)  # type: ignore[arg-type]
+        strategy = strategies.validate(raw)
+        with self.storage.transaction():
+            account = self.storage.account(compte)
+            if account.mode != AUTO:
+                raise InvalidInput(
+                    f"Le compte '{account.name}' est manuel : une stratégie ne s'active que sur un compte automatique."
+                )
+            record = self.storage.activate_strategy(account.id, strategy.nom, strategy.dumps(), self.clock())
+        log.info("Stratégie %s activée sur le compte %s.", strategy.nom, account.name)
+        return account, record, strategy
+
+    def deactivate_strategy(self, *, compte: object = None) -> tuple[Account, ActivationRecord | None]:
+        """Désactive la stratégie du compte. Une position ouverte garde son stop, son objectif et la clôture de session."""
+        with self.storage.transaction():
+            account = self.storage.account(compte)
+            record = self.storage.deactivate_strategy(account.id, self.clock(), "desactivee")
+        if record is not None:
+            log.info("Stratégie %s désactivée sur le compte %s.", record.name, account.name)
+        return account, record
+
+    def active_strategy(self, *, compte: object = None) -> tuple[Account, ActivationRecord | None]:
+        account = self.storage.account(compte, open_only=False)
+        return account, self.storage.active_strategy(account.id)
+
+    def active_strategies(self) -> list[ActivationRecord]:
+        return self.storage.active_strategies()
+
+    def signals(self, *, compte: object = None, decision: str | None = None, limit: int = 100) -> list[SignalRecord]:
+        if decision is not None and decision not in DECISIONS:
+            raise InvalidInput(f"Décision inconnue : '{decision}' (choix : {', '.join(DECISIONS)}).")
+        account_id = None if compte is None else self.storage.account(compte, open_only=False).id
+        return self.storage.signals(account_id, decision, limit)
+
+    def strategy_context(self, account_id: int, pair: str) -> StrategyContext:
+        portfolio = self.storage.load_portfolio(account_id)
+        has_position = pair in portfolio.positions
+        entered_at = None
+        if has_position:
+            buys = [o.created_at for o in self.storage.orders(account_id) if o.pair == pair and o.side is Side.BUY]
+            entered_at = max(buys, default=None)
+        halted = self.storage.session_halted(account_id, session_date(self.clock()))
+        return StrategyContext(has_position, entered_at, halted, self.storage.session_rules())
+
+    def _live_activation(self, activation_id: int, candle_open: datetime, kind: str) -> ActivationRecord | None:
+        """L'activation, si elle est toujours active et que la bougie n'a pas encore de décision de ce type."""
+        activation = self.storage.activation(activation_id)
+        if activation is None or activation.deactivated_at is not None:
+            return None
+        if self.storage.has_signal(activation_id, candle_open, kind):
+            return None
+        return activation
+
+    def _signal(
+        self, activation: ActivationRecord, strategy: Strategy, candle_open: datetime, kind: str, details: dict
+    ) -> SignalRecord:
+        return SignalRecord(
+            account_id=activation.account_id,
+            activation_id=activation.id,
+            pair=strategy.paire,
+            interval=strategy.intervalle,
+            candle_open_time=candle_open,
+            kind=kind,
+            created_at=self.clock(),
+            decision=IGNORED,
+            reasons=(),
+            order_id=None,
+            refusal_id=None,
+            details=details,
+        )
+
+    def _save_signal(self, signal: SignalRecord) -> SignalRecord | None:
+        try:
+            with self.storage.transaction():
+                saved = self.storage.add_signal(signal)
+        except sqlite3.IntegrityError:
+            return None  # décision déjà enregistrée pour cette bougie (autre connexion)
+        log.info("Signal %s ignoré (compte n°%s) : %s.", signal.kind, signal.account_id, ", ".join(signal.reasons))
+        return saved
+
+    def record_ignored(
+        self, activation_id: int, candle_open: datetime, kind: str, reasons: Sequence[str], details: dict
+    ) -> SignalRecord | None:
+        """Journalise un signal ignoré (qualité, heures, position...), une fois par bougie."""
+        activation = self._live_activation(activation_id, candle_open, kind)
+        if activation is None:
+            return None
+        strategy = strategies.loads(activation.definition)
+        signal = self._signal(activation, strategy, candle_open, kind, details)
+        return self._save_signal(replace(signal, reasons=tuple(reasons)))
+
+    def _equity(self, account_id: int, quotes: dict[str, Quote]) -> Decimal:
+        portfolio = self.storage.load_portfolio(account_id)
+        value = portfolio.account.cash
+        for pair, position in portfolio.positions.items():
+            quote = quotes.get(pair)
+            value += position.quantity * quote.bid if quote is not None else position.cost_basis
+        return value
+
+    def handle_entry_signal(
+        self, activation_id: int, candle_open: datetime, plan: Plan, quotes: dict[str, Quote], details: dict
+    ) -> SignalRecord | None:
+        """Signal d'entrée : achat + stop + objectif ET journal du signal dans une seule transaction.
+        Refus du garde-fou : rien n'est acheté, le refus et le signal 'refuse' sont écrits ensuite.
+        None si la bougie a déjà une décision (redémarrage, doublon) ou si la stratégie n'est plus active."""
+        activation = self._live_activation(activation_id, candle_open, ENTRY)
+        if activation is None:
+            return None
+        strategy = strategies.loads(activation.definition)
+        quote = quotes[strategy.paire]
+        levels = strategies.levels(plan, quote.ask, quote.bid)
+        amount = (self._equity(activation.account_id, quotes) * strategy.taille_pct / 100).quantize(
+            Decimal("0.01"), rounding=ROUND_DOWN
+        )
+        details = {
+            **details,
+            "bid": str(quote.bid),
+            "ask": str(quote.ask),
+            "stop": str(levels.stop),
+            "objectif": str(levels.target),
+            "stop_pct": str(levels.stop_pct),
+            "objectif_pct": str(levels.target_pct),
+            "montant": str(amount),
+        }
+        signal = self._signal(activation, strategy, candle_open, ENTRY, details)
+        if levels.reasons:
+            return self._save_signal(replace(signal, reasons=levels.reasons))
+        try:
+            with self.storage.transaction():
+                result = self._buy_unlogged(
+                    activation.account_id, strategy.paire, amount, levels.stop, levels.target, quotes
+                )
+                saved = self.storage.add_signal(replace(signal, decision=ORDER, order_id=result.order.id))
+        except RiskRefused as exc:
+            with self.storage.transaction():
+                refusal = self._log_refusal(exc.record)
+                saved = self.storage.add_signal(
+                    replace(
+                        signal,
+                        decision=REFUSED,
+                        reasons=tuple(exc.rules),
+                        refusal_id=refusal.id,
+                        details={**details, "message": str(exc)},
+                    )
+                )
+            return saved
+        except sqlite3.IntegrityError:
+            return None
+        except (OrderRejected, InvalidInput, FeedUnavailable) as exc:
+            return self._save_signal(replace(signal, reasons=(IMPOSSIBLE,), details={**details, "message": str(exc)}))
+        finally:
+            self._notify()  # le watcher recharge les stops (posés, ou annulés par le ROLLBACK)
+        log.info(
+            "Stratégie %s : entrée, ordre n°%s (%s USDT, stop %s, objectif %s).",
+            strategy.nom, result.order.id, amount, levels.stop, levels.target,
+        )
+        return saved
+
+    def handle_exit_signal(
+        self, activation_id: int, candle_open: datetime, quote: Quote, details: dict
+    ) -> SignalRecord | None:
+        """Signal de sortie : vente de toute la position au bid, sans garde-fou, et journal du signal."""
+        activation = self._live_activation(activation_id, candle_open, EXIT)
+        if activation is None:
+            return None
+        strategy = strategies.loads(activation.definition)
+        details = {**details, "bid": str(quote.bid), "ask": str(quote.ask)}
+        signal = self._signal(activation, strategy, candle_open, EXIT, details)
+        try:
+            with self.storage.transaction():
+                result = self._sell(activation.account_id, strategy.paire, "tout", quote)
+                saved = self.storage.add_signal(replace(signal, decision=ORDER, order_id=result.order.id))
+        except sqlite3.IntegrityError:
+            return None
+        except (OrderRejected, InvalidInput) as exc:
+            return self._save_signal(replace(signal, reasons=(IMPOSSIBLE,), details={**details, "message": str(exc)}))
+        finally:
+            self._notify()
+        log.info("Stratégie %s : sortie sur signal, ordre n°%s.", strategy.nom, result.order.id)
+        return saved
 
     # --- Consultation ---
 

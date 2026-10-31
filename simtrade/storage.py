@@ -215,6 +215,7 @@ class Storage:
 
     def _archive(self, account_id: int, now: datetime, reason: str) -> None:
         self.cancel_account_pending(account_id, reason, now)
+        self.deactivate_strategy(account_id, now, reason)
         self.conn.execute(
             "UPDATE accounts SET active = 0, archived_at = ? WHERE id = ?", (now.isoformat(), account_id)
         )
@@ -507,6 +508,138 @@ class Storage:
         ).fetchone()
         return row is not None
 
+    # --- Stratégies et signaux ---
+
+    def active_strategy(self, account_id: int) -> ActivationRecord | None:
+        row = self.conn.execute(
+            "SELECT * FROM strategy_activations WHERE account_id = ? AND deactivated_at IS NULL", (account_id,)
+        ).fetchone()
+        return None if row is None else _activation(row)
+
+    def active_strategies(self) -> list[ActivationRecord]:
+        """Stratégies actives des comptes ouverts."""
+        rows = self.conn.execute(
+            "SELECT s.* FROM strategy_activations s JOIN accounts a ON a.id = s.account_id "
+            "WHERE s.deactivated_at IS NULL AND a.archived_at IS NULL ORDER BY s.id"
+        )
+        return [_activation(r) for r in rows]
+
+    def activation(self, activation_id: int) -> ActivationRecord | None:
+        row = self.conn.execute("SELECT * FROM strategy_activations WHERE id = ?", (activation_id,)).fetchone()
+        return None if row is None else _activation(row)
+
+    def activate_strategy(self, account_id: int, name: str, definition: str, now: datetime) -> ActivationRecord:
+        """Active une stratégie ; celle qui était active sur le compte est désactivée (remplacée)."""
+        self.deactivate_strategy(account_id, now, "remplacee")
+        cur = self.conn.execute(
+            "INSERT INTO strategy_activations (account_id, name, definition, activated_at) VALUES (?, ?, ?, ?)",
+            (account_id, name, definition, now.isoformat()),
+        )
+        return ActivationRecord(cur.lastrowid, account_id, name, definition, now, None, None)
+
+    def deactivate_strategy(self, account_id: int, now: datetime, reason: str) -> ActivationRecord | None:
+        active = self.active_strategy(account_id)
+        if active is None:
+            return None
+        self.conn.execute(
+            "UPDATE strategy_activations SET deactivated_at = ?, reason = ? WHERE id = ?",
+            (now.isoformat(), reason, active.id),
+        )
+        return replace(active, deactivated_at=now, reason=reason)
+
+    def has_signal(self, activation_id: int, candle_open_time: datetime, kind: str) -> bool:
+        row = self.conn.execute(
+            "SELECT 1 FROM signals WHERE activation_id = ? AND candle_open_time = ? AND kind = ?",
+            (activation_id, candle_open_time.isoformat(), kind),
+        ).fetchone()
+        return row is not None
+
+    def add_signal(self, signal: SignalRecord) -> SignalRecord:
+        """Lève sqlite3.IntegrityError si la bougie a déjà une décision pour ce type (dédoublonnage)."""
+        cur = self.conn.execute(
+            "INSERT INTO signals (account_id, activation_id, pair, interval, candle_open_time, kind, created_at, "
+            "decision, reasons, order_id, refusal_id, details) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                signal.account_id,
+                signal.activation_id,
+                signal.pair,
+                signal.interval,
+                signal.candle_open_time.isoformat(),
+                signal.kind,
+                signal.created_at.isoformat(),
+                signal.decision,
+                ",".join(signal.reasons),
+                signal.order_id,
+                signal.refusal_id,
+                json.dumps(signal.details, ensure_ascii=False),
+            ),
+        )
+        return replace(signal, id=cur.lastrowid)
+
+    def signals(
+        self, account_id: int | None = None, decision: str | None = None, limit: int = 100
+    ) -> list[SignalRecord]:
+        """Journal des signaux, du plus récent au plus ancien."""
+        clauses, args = [], []
+        if account_id is not None:
+            clauses.append("account_id = ?")
+            args.append(account_id)
+        if decision is not None:
+            clauses.append("decision = ?")
+            args.append(decision)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        rows = self.conn.execute(f"SELECT * FROM signals{where} ORDER BY id DESC LIMIT ?", (*args, limit))
+        return [
+            SignalRecord(
+                account_id=r["account_id"],
+                activation_id=r["activation_id"],
+                pair=r["pair"],
+                interval=r["interval"],
+                candle_open_time=datetime.fromisoformat(r["candle_open_time"]),
+                kind=r["kind"],
+                created_at=datetime.fromisoformat(r["created_at"]),
+                decision=r["decision"],
+                reasons=tuple(x for x in r["reasons"].split(",") if x),
+                order_id=r["order_id"],
+                refusal_id=r["refusal_id"],
+                details=json.loads(r["details"]),
+                id=r["id"],
+            )
+            for r in rows
+        ]
+
+
+@dataclass(frozen=True)
+class ActivationRecord:
+    """Stratégie activée sur un compte (définition figée au moment de l'activation)."""
+
+    id: int
+    account_id: int
+    name: str
+    definition: str  # JSON canonique
+    activated_at: datetime
+    deactivated_at: datetime | None
+    reason: str | None
+
+
+@dataclass(frozen=True)
+class SignalRecord:
+    """Entrée du journal des signaux : une décision par stratégie, par bougie et par type."""
+
+    account_id: int
+    activation_id: int
+    pair: str
+    interval: str
+    candle_open_time: datetime
+    kind: str  # "entree" ou "sortie"
+    created_at: datetime
+    decision: str  # "ordre", "refuse" ou "ignore"
+    reasons: tuple[str, ...]
+    order_id: int | None
+    refusal_id: int | None
+    details: dict
+    id: int | None = None
+
 
 @dataclass(frozen=True)
 class RefusalRecord:
@@ -612,4 +745,16 @@ def _pending(row: sqlite3.Row) -> PendingOrder:
         protection=bool(row["protection"]),
         stop_price=_opt_dec(row["stop_price"]),
         target_price=_opt_dec(row["target_price"]),
+    )
+
+
+def _activation(row: sqlite3.Row) -> ActivationRecord:
+    return ActivationRecord(
+        row["id"],
+        row["account_id"],
+        row["name"],
+        row["definition"],
+        datetime.fromisoformat(row["activated_at"]),
+        _opt_dt(row["deactivated_at"]),
+        row["reason"],
     )

@@ -14,6 +14,29 @@ from simtrade.models import Quote, Trade
 T = TypeVar("T")
 
 
+class FlowStats:
+    """File de réception d'une connexion websocket (bibliothèque websockets) : longueur max et pauses.
+
+    Au-delà de `max_queue` trames en attente, websockets suspend la lecture du socket ; pendant la
+    pause, le pong de l'exchange n'est pas lu non plus (« keepalive ping timeout » possible)."""
+
+    def __init__(self) -> None:
+        self.queue_max = 0  # trames en attente au plus, juste après une lecture
+        self.pauses = 0  # passages en pause de la lecture du socket
+        self._paused = False
+
+    def sample(self, ws: object) -> None:
+        assembler = getattr(ws, "recv_messages", None)
+        frames = getattr(assembler, "frames", None)
+        if frames is None:
+            return
+        self.queue_max = max(self.queue_max, len(frames))
+        paused = bool(getattr(assembler, "paused", False))
+        if paused and not self._paused:
+            self.pauses += 1
+        self._paused = paused
+
+
 class PriceFeed(ABC):
     name: str = "?"
     has_trades: bool = False  # True si la source sait aussi fournir les transactions (volume)
