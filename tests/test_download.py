@@ -53,11 +53,10 @@ def test_pagination(tmp_path):
 
 def test_reprise_et_idempotence(tmp_path):
     rows = minute_rows(T0, 25)
-    fake = FakeBinance({"BTCUSDT": rows[:12]})  # Binance n'a encore que 12 minutes
+    fake = FakeBinance({"BTCUSDT": rows})
     d, store, _ = make(tmp_path, fake)
-    run(d)
+    run(d, end=T0 + 12 * MIN)  # premier téléchargement arrêté après 12 minutes
     assert store.count("BTCUSDT") == 12
-    fake.rows["BTCUSDT"] = rows
     fake.requests.clear()
     report = run(d)
     assert store.count("BTCUSDT") == 25
@@ -135,3 +134,42 @@ def test_plusieurs_paires(tmp_path):
     report = run(d, pairs=("BTCUSDT", "ETHUSDT"))
     assert store.count("BTCUSDT") == 25 and store.count("ETHUSDT") == 24
     assert report.pairs[1].gaps == [(T0, T0 + MIN)]
+
+
+def test_comble_l_ecart_entre_telechargement_et_live(tmp_path):
+    from simtrade.history import parse_kline, to_ms
+    from simtrade.marche import LIVE
+
+    rows = minute_rows(T0, 40)
+    store = MarketStore(tmp_path / "marche.db")
+    store.save([parse_kline(r, "BTCUSDT", "1m") for r in rows[:10]])  # bloc téléchargé
+    store.save([parse_kline(r, "BTCUSDT", "1m") for r in rows[30:40]], LIVE)  # bloc live, plus loin
+    fake = FakeBinance({"BTCUSDT": rows})
+    d, store, _ = make(tmp_path, fake, store=store)
+    report = run(d, end=T0 + 40 * MIN)
+    # seul l'écart [10, 30) est demandé (pages de 10), rien avant ni après
+    assert [int(r["startTime"]) for r in fake.requests] == [to_ms(T0 + 10 * MIN), to_ms(T0 + 20 * MIN)]
+    assert {int(r["endTime"]) for r in fake.requests} == {to_ms(T0 + 30 * MIN) - 1}
+    assert report.pairs[0].rows == 20 and store.count("BTCUSDT") == 40
+    assert report.pairs[0].gaps == [] and store.gaps("BTCUSDT", T0, T0 + 40 * MIN) == []
+
+
+def test_plage_vide_chez_binance_demandee_une_seule_fois(tmp_path):
+    fake = FakeBinance({"BTCUSDT": minute_rows(T0, 25, skip=set(range(8, 14)))})  # panne de Binance 8–13
+    d, store, _ = make(tmp_path, fake)
+    report = run(d)
+    pr = report.pairs[0]
+    assert pr.gaps == [(T0 + 8 * MIN, T0 + 14 * MIN)]
+    assert pr.binance == [(T0 + 8 * MIN, T0 + 14 * MIN)] and pr.pending == []
+    assert store.binance_empty("BTCUSDT") == [(T0 + 8 * MIN, T0 + 14 * MIN)]
+    fake.requests.clear()
+    report = run(d)  # relance : la plage vide n'est plus redemandée
+    assert fake.requests == []
+    assert report.pairs[0].binance == [(T0 + 8 * MIN, T0 + 14 * MIN)] and report.pairs[0].pending == []
+
+
+def test_plage_vide_recente_pas_memorisee(tmp_path):
+    fake = FakeBinance({"BTCUSDT": minute_rows(T0, 55)})  # Binance n'a pas encore publié 55–59
+    d, store, _ = make(tmp_path, fake)
+    report = run(d, end=NOW)
+    assert store.binance_empty("BTCUSDT") == [] and report.pairs[0].pending == [(T0 + 55 * MIN, NOW)]

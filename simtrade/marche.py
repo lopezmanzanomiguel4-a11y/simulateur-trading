@@ -7,6 +7,7 @@ jamais de doublon. Les intervalles 5m et 15m ne sont pas stockés : ils sont agr
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from collections.abc import Iterable
 from datetime import datetime, timedelta
@@ -21,6 +22,7 @@ MINUTE = timedelta(minutes=1)
 MINUTE_MS = 60_000
 DOWNLOAD = "telechargement"
 LIVE = "live"
+EMPTY_KEY = "binance_vide:"  # meta : plages renvoyées vides par Binance, par paire (JSON [[début_ms, fin_ms], ...])
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS klines_1m (
@@ -155,6 +157,21 @@ class MarketStore:
             gaps.append((from_ms(first_last[1] + MINUTE_MS), end))
         return gaps
 
+    def binance_empty(self, pair: str) -> list[tuple[datetime, datetime]]:
+        """Plages déjà demandées à Binance et renvoyées vides (panne de l'exchange), triées, fusionnées."""
+        row = self.conn.execute("SELECT value FROM meta WHERE key = ?", (EMPTY_KEY + pair,)).fetchone()
+        return [] if row is None else [(from_ms(a), from_ms(b)) for a, b in json.loads(row[0])]
+
+    def add_binance_empty(self, pair: str, start: datetime, end: datetime) -> None:
+        if end <= start:
+            return
+        ranges = merge_ranges(self.binance_empty(pair) + [(start, end)])
+        value = json.dumps([[to_ms(a), to_ms(b)] for a, b in ranges])
+        self.conn.execute(
+            "INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+            (EMPTY_KEY + pair, value),
+        )
+
     def size_bytes(self) -> int:
         """Taille de la base sur disque (fichier principal + WAL)."""
         if self.path == ":memory:":
@@ -169,3 +186,38 @@ class MarketStore:
 
 def missing_minutes(gaps: Iterable[tuple[datetime, datetime]]) -> int:
     return sum((b - a) // MINUTE for a, b in gaps)
+
+
+Range = tuple[datetime, datetime]
+
+
+def merge_ranges(ranges: Iterable[Range]) -> list[Range]:
+    out: list[Range] = []
+    for a, b in sorted(r for r in ranges if r[1] > r[0]):
+        if out and a <= out[-1][1]:
+            out[-1] = (out[-1][0], max(out[-1][1], b))
+        else:
+            out.append((a, b))
+    return out
+
+
+def subtract_ranges(ranges: Iterable[Range], removed: Iterable[Range]) -> list[Range]:
+    """`ranges` privées de `removed` (intervalles [début, fin))."""
+    cuts = merge_ranges(removed)
+    out: list[Range] = []
+    for a, b in merge_ranges(ranges):
+        for c, d in cuts:
+            if d <= a or c >= b:
+                continue
+            if c > a:
+                out.append((a, c))
+            a = max(a, d)
+            if a >= b:
+                break
+        if a < b:
+            out.append((a, b))
+    return out
+
+
+def intersect_ranges(ranges: Iterable[Range], start: datetime, end: datetime) -> list[Range]:
+    return [(max(a, start), min(b, end)) for a, b in merge_ranges(ranges) if b > start and a < end]

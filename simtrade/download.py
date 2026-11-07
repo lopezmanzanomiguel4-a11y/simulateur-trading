@@ -20,7 +20,7 @@ from pathlib import Path
 from simtrade.errors import SimTradeError
 from simtrade.history import BinanceHistory, RateLimited
 from simtrade.market import bucket_start
-from simtrade.marche import DOWNLOAD, MINUTE, MarketStore, missing_minutes
+from simtrade.marche import DOWNLOAD, MINUTE, MarketStore, intersect_ranges, missing_minutes, subtract_ranges
 from simtrade.models import utcnow
 
 MIN_FREE_BYTES = 5 * 1024**3  # 5 Go libres en permanence
@@ -28,6 +28,7 @@ BYTES_PER_ROW = 200  # estimation prudente (ligne + index), vérifiée à l'essa
 WEIGHT_PAUSE = 4800  # 80 % des 6000 autorisés par minute
 DEFAULT_RETRY = 60.0
 MAX_RETRIES = 5
+RECENT = timedelta(minutes=10)  # plage vide plus récente : pas mémorisée (kline peut-être pas encore publiée)
 
 
 class DiskFull(SimTradeError):
@@ -39,11 +40,20 @@ class PairReport:
     pair: str
     rows: int = 0  # lignes écrites pendant ce téléchargement
     requests: int = 0
-    gaps: list[tuple[datetime, datetime]] = field(default_factory=list)  # minutes absentes chez Binance
+    gaps: list[tuple[datetime, datetime]] = field(default_factory=list)  # toutes les minutes absentes de la base
+    binance: list[tuple[datetime, datetime]] = field(default_factory=list)  # dont : renvoyées vides par Binance
+    pending: list[tuple[datetime, datetime]] = field(default_factory=list)  # dont : encore à télécharger
 
     @property
     def missing(self) -> int:
         return missing_minutes(self.gaps)
+
+
+def gap_report(store: MarketStore, pr: PairReport, start: datetime, end: datetime) -> PairReport:
+    pr.gaps = store.gaps(pr.pair, start, end)
+    pr.binance = intersect_ranges(store.binance_empty(pr.pair), start, end)
+    pr.pending = subtract_ranges(pr.gaps, pr.binance)
+    return pr
 
 
 @dataclass
@@ -57,18 +67,12 @@ class DownloadReport:
 
 
 def segments(store: MarketStore, pair: str, start: datetime, end: datetime) -> list[tuple[datetime, datetime]]:
-    """Ce qui reste à télécharger : avant la première minute enregistrée et après la dernière (reprise).
-    Les trous intérieurs ne sont pas retéléchargés : ils sont rapportés."""
-    bounds = store.bounds(pair)
-    if bounds is None or bounds[1] < start or bounds[0] >= end:
-        return [(start, end)] if start < end else []
-    first, last = bounds
-    out = []
-    if first > start:
-        out.append((start, first))
-    if last + MINUTE < end:
-        out.append((max(start, last + MINUTE), end))
-    return out
+    """Ce qui reste à télécharger dans [start, end) : tous les trous (avant, entre et après les minutes
+    enregistrées, par exemple entre un téléchargement et des bougies live), sauf les plages déjà demandées
+    et renvoyées vides par Binance."""
+    if start >= end:
+        return []
+    return subtract_ranges(store.gaps(pair, start, end), store.binance_empty(pair))
 
 
 def estimate_rows(store: MarketStore, pairs: Sequence[str], start: datetime, end: datetime) -> int:
@@ -110,6 +114,10 @@ class Downloader:
             )
         return needed
 
+    def _empty(self, pair: str, a: datetime, b: datetime, current: datetime) -> None:
+        """Mémorise une plage demandée et renvoyée vide (hors minutes trop récentes)."""
+        self.store.add_binance_empty(pair, a, min(b, current - RECENT))
+
     async def _wait(self, seconds: float, report: DownloadReport, why: str) -> None:
         report.waits.append(seconds)
         if self.progress:
@@ -147,13 +155,19 @@ class Downloader:
                     raw = await self._page(pair, cursor, b, report, pr)
                     page = [c for c in raw if cursor <= c.open_time < b]
                     if page:
+                        expected = cursor  # trous chez Binance avant la page et entre ses lignes
+                        for c in page:
+                            if c.open_time > expected:
+                                self._empty(pair, expected, c.open_time, current)
+                            expected = c.open_time + MINUTE
                         pr.rows += self.store.save(page, DOWNLOAD)
                         cursor = page[-1].open_time + MINUTE
                         if self.progress:
                             self.progress(f"{pair} : jusqu'à {cursor:%Y-%m-%d %H:%M} UTC ({pr.rows} lignes)")
                     if len(raw) < self.history.page_size:
-                        break  # page incomplète : plus rien chez Binance sur ce segment
-            pr.gaps = self.store.gaps(pair, start, end)
+                        self._empty(pair, cursor, b, current)  # page incomplète : plus rien sur ce segment
+                        break
+            gap_report(self.store, pr, start, end)
         report.size_bytes = self.store.size_bytes()
         report.free_bytes_after = self._free()
         return report

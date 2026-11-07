@@ -724,6 +724,7 @@ def cmd_stats(service: TradingService, args: argparse.Namespace) -> int:
 def cmd_marche(service: TradingService, args: argparse.Namespace):
     from datetime import timedelta
 
+    from simtrade.download import PairReport, gap_report
     from simtrade.marche import missing_minutes
 
     store = service.market_store()
@@ -733,12 +734,13 @@ def cmd_marche(service: TradingService, args: argparse.Namespace):
         for pair in args.paires:
             bounds = store.bounds(pair)
             if bounds is None:
-                rows.append((pair, "0", "-", "-", "-"))
+                rows.append((pair, "0", "-", "-", "-", "-"))
                 continue
-            gaps = store.gaps(pair, bounds[0], bounds[1] + timedelta(minutes=1))
+            r = gap_report(store, PairReport(pair), bounds[0], bounds[1] + timedelta(minutes=1))
             rows.append((pair, str(store.count(pair)), local(bounds[0]), local(bounds[1]),
-                         f"{len(gaps)} ({missing_minutes(gaps)} min)"))
-        print(table(["Paire", "Lignes", "Première", "Dernière", "Trous"], rows, left=1))
+                         f"{len(r.binance)} ({missing_minutes(r.binance)} min)",
+                         f"{len(r.pending)} ({missing_minutes(r.pending)} min)"))
+        print(table(["Paire", "Lignes", "Première", "Dernière", "Trous Binance", "À télécharger"], rows, left=1))
         return 0
     return _download(store, args)
 
@@ -747,6 +749,7 @@ async def _download(store, args: argparse.Namespace) -> int:
     from datetime import timedelta
 
     from simtrade.download import Downloader
+    from simtrade.marche import missing_minutes
     from simtrade.history import BinanceHistory
     from simtrade.models import utcnow
     from simtrade.stats import parse_utc
@@ -763,11 +766,13 @@ async def _download(store, args: argparse.Namespace) -> int:
         await history.aclose()
     elapsed = time.perf_counter() - started
     print(f"Période : {start:%Y-%m-%d %H:%M} → {end:%Y-%m-%d %H:%M} UTC, durée {elapsed:.0f} s")
-    rows = [(p.pair, str(p.rows), str(p.requests), f"{len(p.gaps)} ({p.missing} min)") for p in report.pairs]
-    print(table(["Paire", "Lignes écrites", "Requêtes", "Trous"], rows, left=1))
+    rows = [(p.pair, str(p.rows), str(p.requests), f"{len(p.binance)} ({missing_minutes(p.binance)} min)",
+             f"{len(p.pending)} ({missing_minutes(p.pending)} min)") for p in report.pairs]
+    print(table(["Paire", "Lignes écrites", "Requêtes", "Trous Binance", "À télécharger"], rows, left=1))
     for p in report.pairs:
-        for a, b in p.gaps[:20]:
-            print(f"  trou {p.pair} : {a:%Y-%m-%d %H:%M} → {b:%Y-%m-%d %H:%M} UTC")
+        for kind, ranges in (("Binance", p.binance), ("à télécharger", p.pending)):
+            for a, b in ranges[:20]:
+                print(f"  trou {kind} {p.pair} : {a:%Y-%m-%d %H:%M} → {b:%Y-%m-%d %H:%M} UTC")
     print(f"Taille de marche.db : {report.size_bytes / 1e6:.1f} Mo ; espace libre : {report.free_bytes_after / 1e9:.1f} Go")
     if report.waits:
         print(f"Attentes (poids, 429/418) : {len(report.waits)}, {sum(report.waits):.0f} s au total")
