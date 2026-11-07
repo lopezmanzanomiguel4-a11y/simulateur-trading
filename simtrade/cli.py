@@ -141,6 +141,24 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("derniere_entree", metavar="dernière_entrée", nargs="?", help="HH:MM (défaut 23:00)")
     p.add_argument("cloture", metavar="clôture", nargs="?", help="HH:MM (défaut 23:55)")
 
+    p = sub.add_parser("journal", parents=[acc], help="signaux, refus, ordres et trades du compte, dans l'ordre")
+    p.add_argument("--limite", type=int, default=50, help="nombre de lignes (les plus récentes, défaut 50)")
+
+    p = sub.add_parser("stats", parents=[acc], help="statistiques du compte (ou d'une stratégie)")
+    p.add_argument("--strategie", help="nom de la stratégie (trades de cette stratégie seulement)")
+    p.add_argument("--depuis", help="début (AAAA-MM-JJ ou AAAA-MM-JJTHH:MM, UTC)")
+    p.add_argument("--jusqu-a", dest="jusqu_a", help="fin (exclue)")
+
+    p = sub.add_parser("marche", help="base des bougies 1m (marche.db) : téléchargement et état")
+    actions = p.add_subparsers(dest="action", required=True, metavar="action")
+    q = actions.add_parser("telecharger", help="télécharge les klines 1m Binance (reprend là où on s'est arrêté)")
+    q.add_argument("--paires", nargs="+", default=list(PAIRS), help="paires (défaut : les trois)")
+    q.add_argument("--jours", type=int, default=183, help="nombre de jours jusqu'à aujourd'hui 00:00 UTC (défaut 183)")
+    q.add_argument("--depuis", help="début (AAAA-MM-JJ, UTC), remplace --jours")
+    q.add_argument("--jusqu-a", dest="jusqu_a", help="fin exclue (défaut : aujourd'hui 00:00 UTC)")
+    q = actions.add_parser("etat", help="lignes, période, trous et taille de marche.db")
+    q.add_argument("--paires", nargs="+", default=list(PAIRS))
+
     sub.add_parser("info", help="chemin de la base et comptes enregistrés")
     sub.add_parser("api", help="lance l'API HTTP sur http://127.0.0.1:8000 (exécute les ordres en attente)")
     return parser
@@ -162,6 +180,7 @@ def main(argv: Sequence[str] | None = None, service: TradingService | None = Non
         print("\nArrêt.")
         return 0
     finally:
+        service.close_market_store()
         service.storage.close()
 
 
@@ -649,6 +668,112 @@ def cmd_info(service: TradingService, args: argparse.Namespace) -> int:
     return 0
 
 
+def _num(value, digits: int = 2) -> str:
+    return "-" if value is None else fmt.num(value, digits)
+
+
+def cmd_journal(service: TradingService, args: argparse.Namespace) -> int:
+    account, entries = service.journal(compte=args.compte, limit=args.limite)
+    print(account_title(account))
+    if not entries:
+        print("Journal vide.")
+        return 0
+    rows = []
+    for e in entries:
+        item = e.item
+        if e.kind == "signal":
+            text = f"{item.kind} {item.pair} {item.interval}, bougie {local(item.candle_open_time)} : {item.decision}"
+            if item.reasons:
+                text += f" ({', '.join(item.reasons)})"
+        elif e.kind == "refus":
+            text = f"{item.pair} : {', '.join(item.rules)}, {item.message}"
+        elif e.kind == "ordre":
+            text = f"{side_label(item)} {fmt.qty(item.quantity)} {item.pair} à {fmt.price(item.price)}, frais {fmt.usdt(item.fee)}"
+        else:
+            text = (f"{item.pair} {local(item.opened_at)} → {local(item.closed_at)}, P&L {fmt.usdt(item.pnl, sign=True)}, "
+                    f"sortie : {item.exit_reason}" + (f", stratégie {item.strategy}" if item.strategy else ""))
+        rows.append((local(e.at), e.kind, str(e.ref or ""), text))
+    print(table(["Date", "Type", "N°", "Détail"], rows, left=4))
+    return 0
+
+
+def cmd_stats(service: TradingService, args: argparse.Namespace) -> int:
+    from simtrade.stats import parse_utc
+
+    start = None if args.depuis is None else parse_utc(args.depuis, "depuis")
+    end = None if args.jusqu_a is None else parse_utc(args.jusqu_a, "jusqu-a")
+    account, s, curve = service.stats(compte=args.compte, strategie=args.strategie, depuis=start, jusqu_a=end)
+    print(account_title(account) + (f", stratégie {args.strategie}" if args.strategie else ""))
+    rows = [
+        ("P&L net", fmt.usdt(s.pnl, sign=True) + f" ({_num(s.pnl_pct)} %)"),
+        ("Drawdown max", f"{_num(s.max_drawdown_pct)} %"),
+        ("Trades", str(s.trades)),
+        ("Taux de réussite", "-" if s.win_rate is None else f"{_num(s.win_rate, 1)} % ({s.wins}/{s.trades})"),
+        ("Gain moyen par trade", "-" if s.avg_pnl is None else fmt.usdt(s.avg_pnl, sign=True)),
+        ("Frais payés", fmt.usdt(s.fees)),
+        ("Sharpe (quotidien × √365)", "-" if s.sharpe is None else f"{s.sharpe:.2f}"),
+        ("Sessions (effectif)", str(s.sessions)),
+        ("Minutes sans bougie (prix reporté)", str(curve.missing)),
+    ]
+    print(table(["Statistique", "Valeur"], rows, left=1))
+    if s.sharpe is None:
+        print("Sharpe non calculé : moins de 2 sessions, ou rendements tous égaux.")
+    return 0
+
+
+def cmd_marche(service: TradingService, args: argparse.Namespace):
+    from datetime import timedelta
+
+    from simtrade.marche import missing_minutes
+
+    store = service.market_store()
+    if args.action == "etat":
+        print(f"Base des bougies : {store.path} ({store.size_bytes() / 1e6:.1f} Mo)")
+        rows = []
+        for pair in args.paires:
+            bounds = store.bounds(pair)
+            if bounds is None:
+                rows.append((pair, "0", "-", "-", "-"))
+                continue
+            gaps = store.gaps(pair, bounds[0], bounds[1] + timedelta(minutes=1))
+            rows.append((pair, str(store.count(pair)), local(bounds[0]), local(bounds[1]),
+                         f"{len(gaps)} ({missing_minutes(gaps)} min)"))
+        print(table(["Paire", "Lignes", "Première", "Dernière", "Trous"], rows, left=1))
+        return 0
+    return _download(store, args)
+
+
+async def _download(store, args: argparse.Namespace) -> int:
+    from datetime import timedelta
+
+    from simtrade.download import Downloader
+    from simtrade.history import BinanceHistory
+    from simtrade.models import utcnow
+    from simtrade.stats import parse_utc
+
+    today = utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    end = parse_utc(args.jusqu_a, "jusqu-a") if args.jusqu_a else today
+    start = parse_utc(args.depuis, "depuis") if args.depuis else end - timedelta(days=args.jours)
+    history = BinanceHistory()
+    started = time.perf_counter()
+    try:
+        downloader = Downloader(store, history, progress=lambda m: print("  " + m, flush=True))
+        report = await downloader.download(args.paires, start, end)
+    finally:
+        await history.aclose()
+    elapsed = time.perf_counter() - started
+    print(f"Période : {start:%Y-%m-%d %H:%M} → {end:%Y-%m-%d %H:%M} UTC, durée {elapsed:.0f} s")
+    rows = [(p.pair, str(p.rows), str(p.requests), f"{len(p.gaps)} ({p.missing} min)") for p in report.pairs]
+    print(table(["Paire", "Lignes écrites", "Requêtes", "Trous"], rows, left=1))
+    for p in report.pairs:
+        for a, b in p.gaps[:20]:
+            print(f"  trou {p.pair} : {a:%Y-%m-%d %H:%M} → {b:%Y-%m-%d %H:%M} UTC")
+    print(f"Taille de marche.db : {report.size_bytes / 1e6:.1f} Mo ; espace libre : {report.free_bytes_after / 1e9:.1f} Go")
+    if report.waits:
+        print(f"Attentes (poids, 429/418) : {len(report.waits)}, {sum(report.waits):.0f} s au total")
+    return 0
+
+
 def cmd_api() -> int:
     from simtrade.api import run  # import paresseux : FastAPI n'est chargé que pour l'API
 
@@ -679,4 +804,7 @@ COMMANDS = {
     "comptes": cmd_comptes,
     "session": cmd_session,
     "info": cmd_info,
+    "journal": cmd_journal,
+    "stats": cmd_stats,
+    "marche": cmd_marche,
 }

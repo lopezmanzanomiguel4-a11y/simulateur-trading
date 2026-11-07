@@ -227,6 +227,45 @@ class MarketData:
         return self.series[(pair, interval)].last(limit)
 
 
+def aggregate(candles_1m: Sequence[Candle], interval: str) -> list[Candle]:
+    """Bougies `interval` agrégées depuis des 1m triées (ouverture de la première, plus haut, plus bas,
+    clôture de la dernière, sommes du volume, du notional et des transactions). Une bougie à laquelle
+    il manque une minute est marquée `complete=False`."""
+    seconds = INTERVALS[interval]
+    expected = seconds // 60
+    out: list[Candle] = []
+    group: list[Candle] = []
+
+    def flush() -> None:
+        if not group:
+            return
+        first = group[0]
+        out.append(
+            Candle(
+                pair=first.pair,
+                interval=interval,
+                open_time=bucket_start(first.open_time, seconds),
+                open=first.open,
+                high=max(c.high for c in group),
+                low=min(c.low for c in group),
+                close=group[-1].close,
+                volume=sum((c.volume for c in group), Decimal(0)),
+                notional=sum((c.notional for c in group), Decimal(0)),
+                transactions=sum(c.transactions for c in group),
+                origin=ORIGIN_REST if all(c.origin == ORIGIN_REST for c in group) else ORIGIN_LIVE,
+                complete=len(group) == expected and all(c.complete for c in group),
+            )
+        )
+
+    for candle in candles_1m:
+        if group and bucket_start(candle.open_time, seconds) != bucket_start(group[0].open_time, seconds):
+            flush()
+            group = []
+        group.append(candle)
+    flush()
+    return out
+
+
 def closed(candles: Sequence[Candle], now: datetime) -> list[Candle]:
     return [c for c in candles if c.is_closed(now)]
 

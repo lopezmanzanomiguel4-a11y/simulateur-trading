@@ -14,3 +14,7 @@ __pycache__/
 .vscode/
 .idea/
 Thumbs.db
+
+# Local (Claude Code, rapports d'étape)
+.claude/
+RAPPORT-ETAPE*.md

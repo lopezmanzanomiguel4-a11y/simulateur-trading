@@ -9,6 +9,7 @@ Les nombres sortent en chaîne décimale fixe (format(d, "f")), jamais en float.
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Callable
 from contextlib import aclosing, asynccontextmanager
 from datetime import datetime
@@ -20,7 +21,11 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from simtrade.config import db_path
+import json
+
+from simtrade.config import CATALOGUE_PATH, db_path
+from simtrade import stats as stats_mod
+from simtrade.trades import JournalEntry, Trade
 from simtrade import market
 from simtrade.engine import DEFAULT_CAPITAL, normalize_pair
 from simtrade.errors import FeedUnavailable, InvalidCapital, InvalidInput, OrderRejected, SimTradeError
@@ -43,6 +48,12 @@ PORT = 8000
 ServiceFactory = Callable[[PriceFeed], TradingService]
 
 STATUS = {InvalidInput: 400, InvalidCapital: 400, OrderRejected: 400, FeedUnavailable: 503}
+
+
+def _log_failure(future) -> None:
+    exc = future.exception()
+    if exc is not None:
+        logging.getLogger("simtrade.api").error("Enregistrement des bougies 1m impossible : %s", exc)
 
 
 def default_service(feed: PriceFeed) -> TradingService:
@@ -288,6 +299,47 @@ def signal_json(s: SignalRecord) -> dict:
     }
 
 
+def trade_record_json(t: Trade) -> dict:
+    return {
+        "paire": t.pair,
+        "ouverture": iso(t.opened_at),
+        "cloture": iso(t.closed_at),
+        "quantite": dec(t.quantity),
+        "cout": dec(t.cost),
+        "produit": dec(t.proceeds),
+        "frais": dec(t.fees),
+        "pnl": dec(t.pnl),
+        "pnl_pct": dec(t.pnl_pct.quantize(Decimal("0.0001"))),
+        "motif_sortie": t.exit_reason,
+        "strategie": t.strategy,
+        "regime": t.regime,
+        "ordres": list(t.order_ids),
+    }
+
+
+def journal_entry_json(e: JournalEntry) -> dict:
+    convert = {"signal": signal_json, "refus": refusal_json, "ordre": order_json, "trade": trade_record_json}
+    return {"date": iso(e.at), "type": e.kind, "contenu": convert[e.kind](e.item)}
+
+
+def stats_json(s: stats_mod.Stats) -> dict:
+    def q(value: Decimal | None) -> str | None:
+        return None if value is None else dec(value.quantize(Decimal("0.0001")))
+
+    return {
+        "pnl": q(s.pnl),
+        "pnl_pct": q(s.pnl_pct),
+        "drawdown_max_pct": q(s.max_drawdown_pct),
+        "taux_reussite_pct": q(s.win_rate),
+        "gain_moyen": q(s.avg_pnl),
+        "trades": s.trades,
+        "trades_gagnants": s.wins,
+        "frais": q(s.fees),
+        "sharpe": None if s.sharpe is None else round(s.sharpe, 4),
+        "sessions": s.sessions,
+    }
+
+
 def rules_json(rules: SessionRules) -> dict:
     return {"derniere_entree": f"{rules.last_entry:%H:%M}", "cloture": f"{rules.close:%H:%M}", "fuseau": "UTC"}
 
@@ -382,6 +434,13 @@ def create_app(service: ServiceFactory | None = None, hub: PriceHub | None = Non
         db = DbWorker()  # la connexion SQLite est créée et utilisée dans ce seul thread
         svc = await db.run(make_service, feed)
         svc.db = db
+
+        def record_candles(candles: list[market.Candle]) -> None:
+            # Depuis la boucle : on ne fait que mettre l'écriture dans la file du thread SQLite.
+            future = db.submit(svc.save_candles, candles)
+            future.add_done_callback(_log_failure)
+
+        price_hub.on_definitive = record_candles
         watcher = OrderWatcher(svc)
         await svc.run(watcher.load)  # ordres en attente enregistrés avant l'arrêt
         price_hub.listeners.append(watcher.on_quote)
@@ -408,6 +467,8 @@ def create_app(service: ServiceFactory | None = None, hub: PriceHub | None = Non
                 except asyncio.CancelledError:
                     pass
             price_hub.listeners.remove(watcher.on_quote)
+            price_hub.on_definitive = None
+            await svc.run(svc.close_market_store)
             await svc.run(svc.storage.close)
             db.close()
             await price_hub.aclose()
@@ -604,6 +665,44 @@ def create_app(service: ServiceFactory | None = None, hub: PriceHub | None = Non
         svc = svc_of(request)
         found = await svc.run(svc.signals, compte=compte, decision=decision, limit=limite)
         return {"signaux": [signal_json(s) for s in found]}
+
+    # --- Journal, statistiques, catalogue (lecture seule) ---
+
+    @app.get("/journal")
+    async def journal(request: Request, compte: str | None = None, limite: int = Query(200, ge=1, le=10000)) -> dict:
+        svc = svc_of(request)
+        account, entries = await svc.run(svc.journal, compte=compte, limit=limite)
+        return {"compte": account_json(account), "journal": [journal_entry_json(e) for e in entries]}
+
+    @app.get("/stats")
+    async def stats(
+        request: Request,
+        compte: str | None = None,
+        strategie: str | None = None,
+        depuis: str | None = None,
+        jusqu_a: str | None = None,
+    ) -> dict:
+        svc = svc_of(request)
+        start = None if depuis is None else stats_mod.parse_utc(depuis, "depuis")
+        end = None if jusqu_a is None else stats_mod.parse_utc(jusqu_a, "jusqu_a")
+        account, result, curve = await svc.run(svc.stats, compte=compte, strategie=strategie, depuis=start, jusqu_a=end)
+        return {
+            "compte": account_json(account),
+            "strategie": strategie,
+            "debut": iso(curve.points[0][0] - stats_mod.MINUTE) if curve.points else None,
+            "fin": iso(curve.points[-1][0]) if curve.points else None,
+            "stats": stats_json(result),
+            "minutes": len(curve.points),
+            "minutes_sans_bougie": curve.missing,
+            "marquage": "clôture 1m × (1 − s/2), s = 0,02 %",
+        }
+
+    @app.get("/catalogue")
+    async def catalogue() -> dict:
+        path = CATALOGUE_PATH
+        if not path.exists():
+            return {"catalogue": None, "message": "Aucun catalogue : python -m simtrade catalogue construire."}
+        return {"catalogue": await anyio.to_thread.run_sync(lambda: json.loads(path.read_text(encoding="utf-8")))}
 
     # --- Session ---
 

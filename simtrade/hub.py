@@ -111,6 +111,9 @@ class PriceHub:
         self._subscribers: set[asyncio.Queue[Quote]] = set()
         # Appelés pour CHAQUE cotation, sans file ni perte (déclenchement des ordres en attente).
         self.listeners: list[Callable[[Quote], object]] = []
+        # Appelé (depuis la boucle) avec les klines 1m clôturées reçues : l'API le branche sur le thread SQLite
+        # (enregistrement dans marche.db) ; il ne doit rien faire de bloquant.
+        self.on_definitive: Callable[[list[Candle]], object] | None = None
         # Débit et coût du traitement des cotations (exposés dans /info.flux)
         self.update_max = 0.0  # secondes, durée max de update() (cache, abonnés, écouteurs)
         self.rate_max = 0  # cotations reçues dans la seconde la plus chargée
@@ -312,6 +315,7 @@ class PriceHub:
                 # Transactions déjà reçues à la réponse : supposées comptées par les klines renvoyées.
                 cutoffs[key] = (self._last_buffered(pair), max((c.open_time for c in candles), default=None))
                 self.reconciliations.extend(series.merge(candles, self.clock()))
+                self._definitive(interval, candles)
                 self.history_state[key] = "complet"
             self.last_sync = self.clock()
             self.history_error = None
@@ -351,7 +355,20 @@ class PriceHub:
                 log.warning("Réconciliation impossible (%s), nouvel essai plus tard.", self.history_error)
                 return
             self.reconciliations.extend(series.merge(candles, self.clock(), closed_only=True))
+            self._definitive(interval, candles)
             series.mark_checked(now, RECONCILE_GRACE)
+
+    def _definitive(self, interval: str, candles: list[Candle]) -> None:
+        if interval != "1m" or self.on_definitive is None:
+            return
+        now = self.clock()
+        final = [c for c in candles if c.is_closed(now)]
+        if not final:
+            return
+        try:
+            self.on_definitive(final)
+        except Exception:
+            log.exception("Enregistrement des bougies 1m impossible.")
 
     def history_overall(self) -> str:
         states = set(self.history_state.values())

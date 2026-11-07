@@ -4,7 +4,7 @@ Paper trading crypto intraday (argent fictif, prix réels Binance). Vision et é
 
 ## Méthode
 - Une étape de la ROADMAP par session. Plan d'abord (mode Plan), pas de code avant validation.
-- Fin d'étape : `python -m pytest -q`, commit seulement si 0 échec, jamais de push sans accord explicite.
+- Fin d'étape : `.venv\Scripts\python.exe -m pytest -q`, commit seulement si 0 échec, jamais de push sans accord explicite.
 - `RAPPORT-ETAPEn.md` à la racine, jamais commité. Y signaler tout test existant modifié, avec la raison.
 - `ROADMAP.md` : ne jamais la réécrire de mémoire. Avant chaque commit, `git diff ROADMAP.md` ne doit montrer que la ligne de statut de l'étape.
 - Essais réels : toujours `SIMTRADE_DB` sur une base temporaire dans le scratchpad, jamais la vraie base (`%LOCALAPPDATA%\simtrade\simtrade.db`). Arrêter l'API à la fin (port 8000 libre).

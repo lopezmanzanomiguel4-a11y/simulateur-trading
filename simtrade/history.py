@@ -18,6 +18,16 @@ from simtrade.models import EPOCH, clean_decimal
 BINANCE_REST = "https://api.binance.com"
 PAGE_LIMIT = 1000  # maximum autorisé par Binance pour /api/v3/klines
 MS = timedelta(milliseconds=1)
+WEIGHT_HEADER = "X-MBX-USED-WEIGHT-1M"  # poids utilisé dans la minute en cours (limite : 6000)
+
+
+class RateLimited(FeedUnavailable):
+    """HTTP 429 (trop de requêtes) ou 418 (IP bannie temporairement) : attendre `retry_after` secondes."""
+
+    def __init__(self, message: str, retry_after: float | None, status: int):
+        super().__init__(message)
+        self.retry_after = retry_after
+        self.status = status
 
 
 def to_ms(dt: datetime) -> int:
@@ -72,14 +82,30 @@ class BinanceHistory(HistorySource):
     ):
         self.client = client or httpx.AsyncClient(base_url=base_url, timeout=timeout)
         self.page_size = page_size
+        self.used_weight: int | None = None  # dernier X-MBX-USED-WEIGHT-1M reçu
 
     async def _get(self, path: str, params: dict | None = None):
         try:
             response = await self.client.get(path, params=params)
+            weight = response.headers.get(WEIGHT_HEADER, "")
+            if weight.isdigit():
+                self.used_weight = int(weight)
+            if response.status_code in (429, 418):
+                retry = response.headers.get("Retry-After", "")
+                raise RateLimited(
+                    f"Historique Binance indisponible ({path}) : limite de requêtes atteinte "
+                    f"(HTTP {response.status_code}, attendre {retry or '?'} s)",
+                    retry_after=float(retry) if retry.isdigit() else None,
+                    status=response.status_code,
+                )
             response.raise_for_status()
             return response.json()
         except (httpx.HTTPError, ValueError) as exc:
             raise FeedUnavailable(f"Historique Binance indisponible ({path}) : {str(exc) or type(exc).__name__}") from exc
+
+    async def page(self, pair: str, interval: str, start: datetime, end: datetime) -> list[Candle]:
+        """Une page de klines dont le début est dans [start, end), au plus `page_size`."""
+        return await self._page(pair, interval, self.page_size, startTime=to_ms(start), endTime=to_ms(end) - 1)
 
     async def _page(self, pair: str, interval: str, limit: int, **bounds: int) -> list[Candle]:
         params = {"symbol": pair, "interval": interval, "limit": limit, **bounds}

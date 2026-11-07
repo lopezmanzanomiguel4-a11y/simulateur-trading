@@ -84,6 +84,16 @@ python -m simtrade strategie desactiver -c robot
 python -m simtrade signaux                                      # journal des signaux (--compte, --decision, --limite)
 ```
 
+Bougies, journal et statistiques :
+
+```powershell
+python -m simtrade marche telecharger                   # 183 jours de klines 1m (BTC, ETH, SOL) jusqu'à aujourd'hui 00:00 UTC
+python -m simtrade marche telecharger --paires BTCUSDT --depuis 2026-05-01 --jusqu-a 2026-06-01
+python -m simtrade marche etat                          # lignes, période, trous et taille de marche.db
+python -m simtrade journal -c robot                     # signaux, refus, ordres et trades, dans l'ordre (--limite)
+python -m simtrade stats -c robot                       # P&L, drawdown, réussite, Sharpe... (--strategie, --depuis, --jusqu-a)
+```
+
 Comptes et sessions :
 
 ```powershell
@@ -297,6 +307,9 @@ Lance un serveur local sur `http://127.0.0.1:8000` (pas accessible depuis le ré
 | GET | `/strategies` | | modèles de départ et `schema` (types, bornes, défauts de chaque paramètre) |
 | GET, PUT, DELETE | `/comptes/{nom}/strategie` | `{"modele": "tendance-ema", "parametres": {"stop.multiple": "2.5"}}` ou `{"definition": {...}}` (PUT) | stratégie active et `etat` (dernière évaluation) ; PUT active (remplace), DELETE désactive |
 | GET | `/signaux?compte=&decision=&limite=100` | | journal des signaux, du plus récent au plus ancien |
+| GET | `/journal?compte=&limite=200` | | signaux, refus, ordres et trades du compte, du plus ancien au plus récent (les `limite` derniers) |
+| GET | `/stats?compte=&strategie=&depuis=&jusqu_a=` | | statistiques du compte ou d'une stratégie (dates `AAAA-MM-JJ` ou `AAAA-MM-JJTHH:MM`, UTC), effectif et minutes sans bougie |
+| GET | `/catalogue` | | catalogue des stratégies backtestées (`null` s'il n'a pas encore été construit) |
 | GET | `/info` | | chemin de la base, compte courant, `comptes_ouverts`, `comptes_archives`, `session`, `refus_session`, `strategies` (actives, nombre d'évaluations, durée max d'une évaluation), `boucle` (retard de la boucle asyncio), état des flux (`flux`, `flux_volume`), `historique`, `horloge` |
 | GET | `/bougies/{paire}?intervalle=1m&limite=100` | | bougies OHLC, volume, notional, transactions, `origine`, `complete`, `cloturee`, `qualite` |
 | GET | `/indicateurs/{paire}?intervalle=1m&fenetre=1440&sma=20&ema=20&rsi=14&inclure_courante=false&vwap=jour_utc` | | SMA, EMA, RSI, VWAP, variation, volume, `qualite` |
@@ -364,13 +377,42 @@ curl.exe "http://127.0.0.1:8000/indicateurs/sol?inclure_courante=true&vwap=fenet
 
 Paramètre invalide (intervalle ou ancrage inconnu, entier ou booléen illisible, hors bornes) : erreur 400 avec un message qui nomme le paramètre. `limite`, `fenetre`, `sma` et `ema` vont de 1 à 1440, `rsi` de 1 à 1439.
 
+### Bougies, journal et statistiques
+
+**Bougies sauvegardées** (`marche.db`) : base SQLite **séparée** de la base de trading, dans le même dossier (donc dans le dossier temporaire si `SIMTRADE_DB` y pointe), ou là où pointe `SIMTRADE_MARCHE_DB`. Elle ne contient que des klines **1m définitives** (ouverture, haut, bas, clôture, volume, notional, nombre de transactions), une ligne par paire et par minute : réenregistrer la même kline ne crée pas de doublon. Les bougies 5m et 15m sont agrégées depuis les 1m (ouverture de la première minute, plus haut et plus bas, clôture de la dernière, sommes du volume, du notional et des transactions) ; s'il leur manque une minute, elles sont marquées `complete: false`.
+- **En live**, l'API enregistre chaque bougie 1m dès qu'elle est remplacée par sa kline (ainsi que les klines 1m clôturées du préchargement), dans le thread SQLite : la boucle asyncio ne touche jamais la base.
+- **Téléchargement** (`marche telecharger`, CLI seulement) : klines publiques Binance, pages de 1 000 minutes enregistrées une à une ; la commande suivante reprend après la dernière minute enregistrée. Les trous (minutes absentes chez Binance) sont rapportés, pas comblés. Le poids utilisé est lu dans l'en-tête `X-MBX-USED-WEIGHT-1M` : au-delà de 4 800 (sur 6 000 par minute), attente de la minute suivante ; sur une réponse 429 ou 418, attente de `Retry-After` (60 s par défaut) puis nouvel essai de la même page. Refus avant tout téléchargement si l'espace libre estimé après coup (200 octets par ligne) tombe sous 5 Go.
+
+**Trade** (aller-retour) : reconstitué depuis les ordres, de la position nulle à la position nulle sur une paire (renforts et ventes partielles compris). Motif de sortie, d'après le dernier ordre de vente : `stop`, `objectif`, `cloture_session` (clôture de session, tardive ou non), `signal` (vente liée à un signal de sortie), sinon `manuel`. Stratégie : celle du signal d'entrée lié au premier achat. P&L net des deux frais, avec $C$ le coût des achats (frais inclus) et $P$ le produit des ventes (frais déduits) :
+
+$$\text{PnL}_{\text{trade}} = P - C$$
+
+**Journal** (`/journal`, `journal`) : signaux, refus du garde-fou, ordres et trades d'un compte, dans l'ordre chronologique ; à heure égale, la décision avant son effet (signal, refus, ordre, trade).
+
+**Courbe de valeur** $V_m$ : valeur du compte à la fin de chaque minute $m$, solde plus positions marquées au bid. Le bid passé n'étant pas enregistré, il est estimé depuis la clôture 1m $c_{i,m}$ de chaque paire $i$ et un spread fixe $s = 0{,}02\,\%$ (même convention que le backtest) ; une minute absente de `marche.db` reprend le dernier prix connu et est comptée (`minutes_sans_bougie`) :
+
+$$V_m = \text{solde}_m + \sum_i q_{i,m}\, c_{i,m} \left(1 - \frac{s}{2}\right)$$
+
+**Statistiques** (`/stats`, `stats`), sur les $n$ trades fermés de la période, de P&L $p_k$, avec $V_0$ la valeur au début de la période :
+
+| Statistique | Formule |
+|---|---|
+| P&L net | $V_{\text{fin}} - V_0$ (en %, rapporté à $V_0$) |
+| Drawdown maximal | $\max_m \dfrac{\max_{m' \le m} V_{m'} - V_m}{\max_{m' \le m} V_{m'}} \times 100$, le pic partant de $V_0$ |
+| Taux de réussite | $\dfrac{\#\{k : p_k > 0\}}{n} \times 100$ (`null` sans trade) |
+| Gain moyen par trade | $\dfrac{1}{n}\sum_{k=1}^{n} p_k$ |
+| Frais payés | somme des frais des ordres de la période |
+| Sharpe | $\dfrac{\bar r}{\sigma_r}\sqrt{365}$, taux sans risque nul |
+
+Pour le Sharpe, $r_d = \dfrac{V_d}{V_{d-1}} - 1$ est le rendement de chaque session (jour UTC) de la période, avec $V_d$ la valeur en fin de jour ($V_0$ avant le premier) : un jour sans trade a un rendement nul et compte quand même. $\bar r$ est la moyenne et $\sigma_r$ l'écart type (dénominateur $N - 1$) des $N$ rendements. `null` sous 2 sessions ou si $\sigma_r = 0$. Le nombre de sessions (`sessions`) est toujours affiché. Le même module (`stats.py`) servira au backtest.
+
 ## Tests
 
 ```powershell
-python -m pytest
+.venv\Scripts\python.exe -m pytest -q
 ```
 
-Les tests couvrent le moteur (frais, prix moyen, P&L réalisé/latent, performance, refus d'ordres, validation du capital), la persistance (redémarrage, reset, transactions), le parsing des messages Binance/Coinbase, la bascule entre sources, les commandes CLI, les routes de l'API, la reconnexion du flux, le refus des cotations périmées, la construction des bougies, le raccord avec l'historique (klines simulées par `httpx.MockTransport`), les indicateurs (valeurs calculées à la main), la qualité des données et les routes de marché. Pour l'étape 4 : déclenchement et glissement des ordres en attente (dont un stop sauté), exécution par le flux, paires liées, réservations, redémarrage, ordres posés ou annulés par une autre connexion, comptes en parallèle, entrées refusées après l'heure limite, clôture de fin de session, clôture reportée et rattrapage (horloge simulée), migration d'une base des étapes 1 à 3 et annulation complète en cas d'échec. Pour l'étape 5 : chaque règle du garde-fou à la limite exacte, « tout le capital sans stop » refusé et journalisé, entrée + stop atomique, stop qui part après la perte max, clôture de session jamais bloquée, annulation du dernier stop refusée, retard de boucle détecté, aucun accès SQLite depuis l'écouteur de cotations, migration v1 → v2. Pour l'étape 6 : chaque brique (valeurs calculées à la main), chaque borne de paramètre acceptée à la limite et refusée au-delà, objectif sous 0,30 % refusé, aucun signal sur une bougie non clôturée, un seul ordre par signal même après un redémarrage, panne entre l'achat et le commit (ni ordre ni signal, puis un seul ordre), aucun ordre si `qualite` est mauvaise (chaque raison), hors heures et après la dernière entrée, refus du garde-fou journalisé sans nouvel essai, sortie sur signal malgré la perte max, bougie non définitive, rejeu bougie par bougie identique au live, file de réception et chien de garde du flux, migration v2 → v3, routes et CLI des stratégies. Ils utilisent des données simulées ; une garde dans `tests/conftest.py` fait échouer tout test qui tenterait une résolution de nom ou une connexion hors de la machine.
+Les tests couvrent le moteur (frais, prix moyen, P&L réalisé/latent, performance, refus d'ordres, validation du capital), la persistance (redémarrage, reset, transactions), le parsing des messages Binance/Coinbase, la bascule entre sources, les commandes CLI, les routes de l'API, la reconnexion du flux, le refus des cotations périmées, la construction des bougies, le raccord avec l'historique (klines simulées par `httpx.MockTransport`), les indicateurs (valeurs calculées à la main), la qualité des données et les routes de marché. Pour l'étape 4 : déclenchement et glissement des ordres en attente (dont un stop sauté), exécution par le flux, paires liées, réservations, redémarrage, ordres posés ou annulés par une autre connexion, comptes en parallèle, entrées refusées après l'heure limite, clôture de fin de session, clôture reportée et rattrapage (horloge simulée), migration d'une base des étapes 1 à 3 et annulation complète en cas d'échec. Pour l'étape 5 : chaque règle du garde-fou à la limite exacte, « tout le capital sans stop » refusé et journalisé, entrée + stop atomique, stop qui part après la perte max, clôture de session jamais bloquée, annulation du dernier stop refusée, retard de boucle détecté, aucun accès SQLite depuis l'écouteur de cotations, migration v1 → v2. Pour l'étape 6 : chaque brique (valeurs calculées à la main), chaque borne de paramètre acceptée à la limite et refusée au-delà, objectif sous 0,30 % refusé, aucun signal sur une bougie non clôturée, un seul ordre par signal même après un redémarrage, panne entre l'achat et le commit (ni ordre ni signal, puis un seul ordre), aucun ordre si `qualite` est mauvaise (chaque raison), hors heures et après la dernière entrée, refus du garde-fou journalisé sans nouvel essai, sortie sur signal malgré la perte max, bougie non définitive, rejeu bougie par bougie identique au live, file de réception et chien de garde du flux, migration v2 → v3, routes et CLI des stratégies. Pour l'étape 7 : base des bougies (upsert idempotent, trous, chemin à côté de la base de trading), agrégation 1m → 5m/15m égale aux klines de l'intervalle, téléchargement (pagination, reprise, deux fois = mêmes lignes, trous, 429 et 418 puis reprise, poids, refus pour espace disque), enregistrement live dans le thread SQLite et jamais depuis la boucle, trades et motifs de sortie, journal chronologique, statistiques calculées à la main (drawdown, Sharpe avec un jour à 0, taux de réussite, courbe marquée au bid), routes et CLI. Ils utilisent des données simulées ; une garde dans `tests/conftest.py` fait échouer tout test qui tenterait une résolution de nom ou une connexion hors de la machine.
 
 ## Architecture
 
@@ -393,7 +435,11 @@ simtrade/
   service.py   TradingService : point d'entrée unique des interfaces
   watcher.py   OrderWatcher (ordres touchés par chaque cotation) et SessionScheduler (clôtures)
   market.py    calculs de marché purs : bougies OHLC, raccord avec les klines, SMA, EMA, RSI, VWAP, variation, qualité (aucun I/O)
-  history.py   historique public Binance (REST) : klines paginées, heure du serveur
+  history.py   historique public Binance (REST) : klines paginées, heure du serveur, poids et limite de requêtes
+  marche.py    base des bougies 1m (marche.db) : upsert, lecture par période, trous
+  download.py  téléchargement des klines 1m : reprise, poids, attente sur 429/418, garde d'espace disque
+  trades.py    trades reconstitués depuis les ordres, motifs de sortie, journal chronologique (pur)
+  stats.py     courbe de valeur, P&L, drawdown, réussite, gain moyen, frais, Sharpe (pur)
   hub.py       PriceHub (cotations + transactions, cache, bougies, raccord avec l'historique, reconnexion) et CachedFeed
   api.py       API FastAPI : create_app(), routes, websocket /ws/prix
   cli.py       ligne de commande
@@ -417,10 +463,12 @@ L'API ne fait qu'appeler `TradingService`, qui reçoit un `CachedFeed` à la pla
 - **Stratégies long uniquement** (pas de vente à découvert), une position à la fois par stratégie, une stratégie par compte.
 - **Le garde-fou ne protège que les comptes automatiques.** Un compte manuel peut tout faire, par construction.
 - **Perte de session estimée au bid, hors frais de sortie** : la perte réelle à la vente serait un peu plus forte (0,1 % de frais).
-- **Arrêt de session détecté au mieux chaque seconde** (ou à la tentative d'entrée) : un passage très bref sous la limite, entre deux vérifications et sans tentative d'entrée, peut ne pas être enregistré.- **CLI : une connexion websocket par commande** : chaque commande met 1 à 4 s à obtenir un prix (le temps d'établir la connexion). L'API n'a pas ce délai.
+- **Arrêt de session détecté au mieux chaque seconde** (ou à la tentative d'entrée) : un passage très bref sous la limite, entre deux vérifications et sans tentative d'entrée, peut ne pas être enregistré.
+- **CLI : une connexion websocket par commande** : chaque commande met 1 à 4 s à obtenir un prix (le temps d'établir la connexion). L'API n'a pas ce délai.
 - **Coinbase en secours est moins liquide en USDT** : le spread BTC-USDT y est nettement plus large que sur Binance (constaté : environ 3,5 pb contre moins de 0,01 pb), et le canal ticker ne se met à jour qu'à chaque transaction.
 - CLI : pas de reconnexion automatique si le flux continu `prix` est coupé en cours de route (l'API, elle, se reconnecte).
-- **Bougies en mémoire seulement** : rechargées depuis Binance à chaque démarrage (1 journée en 1m, 500 bougies au-delà), rien n'est sauvegardé localement.
+- **Bougies en mémoire rechargées au démarrage** : l'API recharge 1 journée en 1m et 500 bougies au-delà depuis Binance à chaque démarrage. Seules les 1m définitives sont sauvegardées (`marche.db`) ; une minute où l'API ne tournait pas manque, sauf à la télécharger ensuite (`marche telecharger`).
+- **Courbe de valeur au bid estimé** (clôture 1m × (1 − s/2), s = 0,02 %), pas au vrai bid du moment, qui n'est pas enregistré.
 - **Raccord au démarrage et après une coupure** : la bougie en cours manque les transactions exécutées avant que le websocket ne livre (de l'ordre de 1 % du nombre de transactions d'une minute BTC) ; elle est marquée `complete: false` jusqu'à son remplacement par la kline. Les indicateurs par défaut (bougies clôturées) l'utilisent entre sa clôture et son remplacement (2 à 7 s), et durablement si la réconciliation échoue.
 - **Clôture jugée sur l'horloge locale** : l'écart avec Binance est mesuré et signalé (au-delà de 1 s), pas corrigé.
 - **Volume** : celui de la source qui répond, pas un volume global. En repli sur Coinbase, l'historique reste celui de Binance : bougies de deux places différentes, VWAP signalé non fiable. Sur Coinbase, les paires USDT sont peu échangées et la source de transactions est jugée muette si rien n'arrive en 15 s.

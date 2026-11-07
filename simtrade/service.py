@@ -70,6 +70,11 @@ from simtrade.risk import (
 from simtrade.sessions import SessionRules, close_due, entry_allowed, is_late, session_date, validate_rules
 from simtrade.storage import ActivationRecord, RefusalRecord, SignalRecord, Storage
 from simtrade.strategies import Plan, Strategy
+from simtrade import stats as stats_mod
+from simtrade import trades as trades_mod
+from simtrade.config import marche_db_path
+from simtrade.marche import LIVE, MarketStore
+from simtrade.market import Candle
 
 log = logging.getLogger("simtrade.service")
 
@@ -79,6 +84,7 @@ T = TypeVar("T")
 ENTRY = "entree"
 EXIT = "sortie"
 ORDER = "ordre"
+ALL = 10**9  # « sans limite » pour les lectures du journal
 REFUSED = "refuse"
 IGNORED = "ignore"
 DECISIONS = (ORDER, REFUSED, IGNORED)
@@ -124,6 +130,7 @@ class TradingService:
         self.clock = clock
         self.db = db
         self.listeners: list[Callable[[], None]] = []  # prévenus après tout changement d'ordre en attente
+        self._market_store: MarketStore | None = None  # marche.db, ouverte dans le thread de la base
 
     async def run(self, fn: Callable[..., T], *args: Any, **kwargs: Any) -> T:
         """Exécute une partie SQLite dans le thread de la base (directement s'il n'y en a pas)."""
@@ -866,6 +873,69 @@ class TradingService:
             raise InvalidInput(f"Décision inconnue : '{decision}' (choix : {', '.join(DECISIONS)}).")
         account_id = None if compte is None else self.storage.account(compte, open_only=False).id
         return self.storage.signals(account_id, decision, limit)
+
+    # --- Bougies, journal et statistiques (étape 7) ---
+
+    def market_store(self) -> MarketStore:
+        """marche.db à côté de la base de trading (ou SIMTRADE_MARCHE_DB), ouverte au premier appel."""
+        if self._market_store is None:
+            self._market_store = MarketStore(marche_db_path(self.storage.path))
+        return self._market_store
+
+    def save_candles(self, candles: Sequence[Candle]) -> int:
+        """Klines 1m définitives reçues en live (appelé dans le thread de la base)."""
+        return self.market_store().save(candles, LIVE)
+
+    def close_market_store(self) -> None:
+        if self._market_store is not None:
+            self._market_store.close()
+            self._market_store = None
+
+    def account_trades(self, account_id: int) -> tuple[list[Order], list[SignalRecord], list[trades_mod.Trade]]:
+        orders = self.storage.orders(account_id)
+        signals = self.storage.signals(account_id, None, ALL)
+        return orders, signals, trades_mod.trades_from_orders(orders, trades_mod.links_from_signals(signals))
+
+    def journal(self, *, compte: object = None, limit: int = 200) -> tuple[Account, list[trades_mod.JournalEntry]]:
+        """Signaux, refus, ordres et trades du compte, du plus ancien au plus récent (les `limit` derniers)."""
+        account = self.storage.account(compte, open_only=False)
+        orders, signals, trades = self.account_trades(account.id)
+        refusals = self.storage.refusals(account.id, ALL)
+        entries = trades_mod.journal(signals, refusals, orders, trades)
+        return account, entries[-limit:] if limit else entries
+
+    def stats(
+        self,
+        *,
+        compte: object = None,
+        strategie: str | None = None,
+        depuis: datetime | None = None,
+        jusqu_a: datetime | None = None,
+    ) -> tuple[Account, stats_mod.Stats, stats_mod.Curve]:
+        """Statistiques du compte (ou de ses trades d'une stratégie), courbe marquée sur marche.db."""
+        account = self.storage.account(compte, open_only=False)
+        orders, _, trades = self.account_trades(account.id)
+        if strategie is not None:
+            trades = [t for t in trades if t.strategy == strategie]
+            orders = stats_mod.orders_of(trades, orders)
+        start = depuis or account.created_at
+        end = jusqu_a or self.clock()
+        if end <= start:
+            raise InvalidInput("Période vide : 'jusqu_a' doit être après 'depuis'.")
+        in_period = [t for t in trades if start <= t.closed_at < end]
+        pairs = sorted({o.pair for o in orders})
+        store = self.market_store()
+        marks = {p: store.candles(p, start - stats_mod.MINUTE * 60, end) for p in pairs}
+        curve = stats_mod.equity_curve(
+            account.initial_capital, [o for o in orders if o.created_at < end], marks, start, end
+        )
+        fees = sum((o.fee for o in orders if start <= o.created_at < end), Decimal(0))
+        base = account.initial_capital
+        if depuis is not None:  # valeur au début de la période
+            before = [o for o in orders if o.created_at < start]
+            first = stats_mod.equity_curve(base, before, marks, start - stats_mod.MINUTE, start).points
+            base = first[-1][1] if first else base
+        return account, stats_mod.compute(in_period, curve, base, fees), curve
 
     def strategy_context(self, account_id: int, pair: str) -> StrategyContext:
         portfolio = self.storage.load_portfolio(account_id)
