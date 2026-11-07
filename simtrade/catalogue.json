@@ -1,91 +1,204 @@
 {
-  "version": 1,
-  "cree_le": "2026-11-07T17:59:45.742110+00:00",
-  "commit": "ae6a8d9",
-  "periodes": {
-    "donnees": "2026-05-07T00:00:00+00:00",
-    "echantillon": [
-      "2026-05-09T00:00:00+00:00",
-      "2026-09-07T00:00:00+00:00"
-    ],
-    "hors_echantillon": [
-      "2026-09-07T00:00:00+00:00",
-      "2026-11-07T00:00:00+00:00"
-    ]
-  },
-  "intervalle": "5m",
-  "spread_pct": "0.02",
-  "frais_pct": "0.100",
-  "capital": "10000",
-  "grille": {
-    "retour-vwap": {
-      "ecart_vwap.seuil_pct": [
-        "0.4",
-        "0.6",
-        "0.9"
-      ],
-      "rsi_extreme.seuil": [
-        "25",
-        "30",
-        "35"
-      ]
+  "version": 2,
+  "constructions": [
+    {
+      "etape": "7",
+      "cree_le": "2026-11-07T17:59:45.742110+00:00",
+      "commit": "ae6a8d9",
+      "periodes": {
+        "donnees": "2026-05-07T00:00:00+00:00",
+        "echantillon": [
+          "2026-05-09T00:00:00+00:00",
+          "2026-09-07T00:00:00+00:00"
+        ],
+        "hors_echantillon": [
+          "2026-09-07T00:00:00+00:00",
+          "2026-11-07T00:00:00+00:00"
+        ]
+      },
+      "intervalles": {
+        "retour-vwap": "5m",
+        "tendance-ema": "5m",
+        "cassure-range": "5m"
+      },
+      "spread_pct": "0.02",
+      "frais_pct": "0.100",
+      "capital": "10000",
+      "grille": {
+        "retour-vwap": {
+          "ecart_vwap.seuil_pct": [
+            "0.4",
+            "0.6",
+            "0.9"
+          ],
+          "rsi_extreme.seuil": [
+            "25",
+            "30",
+            "35"
+          ]
+        },
+        "tendance-ema": {
+          "croisement_ema.rapide": [
+            6,
+            9,
+            12
+          ],
+          "croisement_ema.lente": [
+            21,
+            30,
+            42
+          ]
+        },
+        "cassure-range": {
+          "cassure_range.minutes": [
+            15,
+            30,
+            60
+          ],
+          "objectif.multiple": [
+            "1",
+            "1.5",
+            "2.5"
+          ]
+        }
+      },
+      "criteres": {
+        "candidate_echantillon": {
+          "trades_min": 30,
+          "pnl": "> 0"
+        },
+        "selection": "voisinage : moyenne du P&L de la combinaison et de ses voisines directes",
+        "bornes": "plus grand rectangle de candidates contenant la combinaison choisie",
+        "admission": {
+          "pnl": "> 0",
+          "achat_0h_cloture": "P&L supérieur",
+          "tirages_battus_min_pct": 90.0,
+          "trades_min": 30
+        },
+        "regime_retenu": {
+          "trades_min": 20,
+          "pnl_par_trade": "> 0 en échantillon"
+        },
+        "sensibilite_spread_pct": "0.05"
+      },
+      "tirages": {
+        "n": 100,
+        "graines": [
+          1,
+          100
+        ]
+      },
+      "synthese": "backtests/synthese.md"
     },
-    "tendance-ema": {
-      "croisement_ema.rapide": [
-        6,
-        9,
-        12
-      ],
-      "croisement_ema.lente": [
-        21,
-        30,
-        42
-      ]
-    },
-    "cassure-range": {
-      "cassure_range.minutes": [
-        15,
-        30,
-        60
-      ],
-      "objectif.multiple": [
-        "1",
-        "1.5",
-        "2.5"
-      ]
+    {
+      "etape": "7b",
+      "cree_le": "2026-11-07T21:47:47.337285+00:00",
+      "commit": "48a90f5",
+      "periodes": {
+        "donnees": "2025-10-16T00:00:00+00:00",
+        "echantillon": [
+          "2025-11-09T00:00:00+00:00",
+          "2026-09-07T00:00:00+00:00"
+        ],
+        "hors_echantillon": [
+          "2026-09-07T00:00:00+00:00",
+          "2026-11-07T00:00:00+00:00"
+        ]
+      },
+      "intervalles": {
+        "tendance-1h": "1h",
+        "cassure-matin": "15m",
+        "repli-tendance": "15m"
+      },
+      "spread_pct": "0.02",
+      "frais_pct": "0.100",
+      "capital": "10000",
+      "grille": {
+        "tendance-1h": {
+          "objectif.multiple": [
+            "2",
+            "3",
+            "4"
+          ],
+          "croisement_ema.lente": [
+            21,
+            30,
+            50
+          ]
+        },
+        "cassure-matin": {
+          "hauteur_range.min_pct": [
+            "1",
+            "1.5",
+            "2"
+          ],
+          "objectif.multiple": [
+            "1",
+            "1.5",
+            "2"
+          ]
+        },
+        "repli-tendance": {
+          "entree.rsi_extreme.seuil": [
+            "35",
+            "40",
+            "45"
+          ],
+          "objectif.valeur": [
+            "1",
+            "1.5",
+            "2"
+          ]
+        }
+      },
+      "criteres": {
+        "candidate_echantillon": {
+          "trades_min": 30,
+          "pnl": "> 0"
+        },
+        "selection": "voisinage : moyenne du P&L de la combinaison et de ses voisines directes",
+        "bornes": "plus grand rectangle de candidates contenant la combinaison choisie",
+        "admission": {
+          "pnl": "> 0",
+          "achat_0h_cloture": "P&L supérieur",
+          "tirages_battus_min_pct": 90.0,
+          "trades_min": 30
+        },
+        "regime_retenu": {
+          "trades_min": 20,
+          "pnl_par_trade": "> 0 en échantillon"
+        },
+        "sensibilite_spread_pct": "0.05"
+      },
+      "tirages": {
+        "n": 100,
+        "graines": [
+          1,
+          100
+        ]
+      },
+      "synthese": "backtests/synthese-7b.md"
     }
-  },
-  "criteres": {
-    "candidate_echantillon": {
-      "trades_min": 30,
-      "pnl": "> 0"
-    },
-    "selection": "voisinage : moyenne du P&L de la combinaison et de ses voisines directes",
-    "bornes": "plus grand rectangle de candidates contenant la combinaison choisie",
-    "admission": {
-      "pnl": "> 0",
-      "achat_0h_cloture": "P&L supérieur",
-      "tirages_battus_min_pct": 90.0,
-      "trades_min": 30
-    },
-    "regime_retenu": {
-      "trades_min": 20,
-      "pnl_par_trade": "> 0 en échantillon"
-    },
-    "sensibilite_spread_pct": "0.05"
-  },
-  "tirages": {
-    "n": 100,
-    "graines": [
-      1,
-      100
-    ]
-  },
+  ],
   "entrees": [],
   "resultats": [
     {
       "modele": "retour-vwap",
       "paire": "BTCUSDT",
+      "etape": "7",
+      "commit": "ae6a8d9",
+      "periodes": {
+        "donnees": "2026-05-07T00:00:00+00:00",
+        "echantillon": [
+          "2026-05-09T00:00:00+00:00",
+          "2026-09-07T00:00:00+00:00"
+        ],
+        "hors_echantillon": [
+          "2026-09-07T00:00:00+00:00",
+          "2026-11-07T00:00:00+00:00"
+        ]
+      },
+      "intervalle": "5m",
       "statut": "rejetee_en_echantillon",
       "raisons": [
         "aucune combinaison avec ≥ 30 trades et un P&L > 0 en échantillon"
@@ -99,6 +212,20 @@
     {
       "modele": "retour-vwap",
       "paire": "ETHUSDT",
+      "etape": "7",
+      "commit": "ae6a8d9",
+      "periodes": {
+        "donnees": "2026-05-07T00:00:00+00:00",
+        "echantillon": [
+          "2026-05-09T00:00:00+00:00",
+          "2026-09-07T00:00:00+00:00"
+        ],
+        "hors_echantillon": [
+          "2026-09-07T00:00:00+00:00",
+          "2026-11-07T00:00:00+00:00"
+        ]
+      },
+      "intervalle": "5m",
       "statut": "rejetee_en_echantillon",
       "raisons": [
         "aucune combinaison avec ≥ 30 trades et un P&L > 0 en échantillon"
@@ -112,6 +239,20 @@
     {
       "modele": "retour-vwap",
       "paire": "SOLUSDT",
+      "etape": "7",
+      "commit": "ae6a8d9",
+      "periodes": {
+        "donnees": "2026-05-07T00:00:00+00:00",
+        "echantillon": [
+          "2026-05-09T00:00:00+00:00",
+          "2026-09-07T00:00:00+00:00"
+        ],
+        "hors_echantillon": [
+          "2026-09-07T00:00:00+00:00",
+          "2026-11-07T00:00:00+00:00"
+        ]
+      },
+      "intervalle": "5m",
       "statut": "rejetee_en_echantillon",
       "raisons": [
         "aucune combinaison avec ≥ 30 trades et un P&L > 0 en échantillon"
@@ -125,6 +266,20 @@
     {
       "modele": "tendance-ema",
       "paire": "BTCUSDT",
+      "etape": "7",
+      "commit": "ae6a8d9",
+      "periodes": {
+        "donnees": "2026-05-07T00:00:00+00:00",
+        "echantillon": [
+          "2026-05-09T00:00:00+00:00",
+          "2026-09-07T00:00:00+00:00"
+        ],
+        "hors_echantillon": [
+          "2026-09-07T00:00:00+00:00",
+          "2026-11-07T00:00:00+00:00"
+        ]
+      },
+      "intervalle": "5m",
       "statut": "rejetee_en_echantillon",
       "raisons": [
         "aucune combinaison avec ≥ 30 trades et un P&L > 0 en échantillon"
@@ -138,6 +293,20 @@
     {
       "modele": "tendance-ema",
       "paire": "ETHUSDT",
+      "etape": "7",
+      "commit": "ae6a8d9",
+      "periodes": {
+        "donnees": "2026-05-07T00:00:00+00:00",
+        "echantillon": [
+          "2026-05-09T00:00:00+00:00",
+          "2026-09-07T00:00:00+00:00"
+        ],
+        "hors_echantillon": [
+          "2026-09-07T00:00:00+00:00",
+          "2026-11-07T00:00:00+00:00"
+        ]
+      },
+      "intervalle": "5m",
       "statut": "rejetee_en_echantillon",
       "raisons": [
         "aucune combinaison avec ≥ 30 trades et un P&L > 0 en échantillon"
@@ -151,6 +320,20 @@
     {
       "modele": "tendance-ema",
       "paire": "SOLUSDT",
+      "etape": "7",
+      "commit": "ae6a8d9",
+      "periodes": {
+        "donnees": "2026-05-07T00:00:00+00:00",
+        "echantillon": [
+          "2026-05-09T00:00:00+00:00",
+          "2026-09-07T00:00:00+00:00"
+        ],
+        "hors_echantillon": [
+          "2026-09-07T00:00:00+00:00",
+          "2026-11-07T00:00:00+00:00"
+        ]
+      },
+      "intervalle": "5m",
       "statut": "rejetee_en_echantillon",
       "raisons": [
         "aucune combinaison avec ≥ 30 trades et un P&L > 0 en échantillon"
@@ -164,6 +347,20 @@
     {
       "modele": "cassure-range",
       "paire": "BTCUSDT",
+      "etape": "7",
+      "commit": "ae6a8d9",
+      "periodes": {
+        "donnees": "2026-05-07T00:00:00+00:00",
+        "echantillon": [
+          "2026-05-09T00:00:00+00:00",
+          "2026-09-07T00:00:00+00:00"
+        ],
+        "hors_echantillon": [
+          "2026-09-07T00:00:00+00:00",
+          "2026-11-07T00:00:00+00:00"
+        ]
+      },
+      "intervalle": "5m",
       "statut": "rejetee_en_echantillon",
       "raisons": [
         "aucune combinaison avec ≥ 30 trades et un P&L > 0 en échantillon"
@@ -177,6 +374,20 @@
     {
       "modele": "cassure-range",
       "paire": "ETHUSDT",
+      "etape": "7",
+      "commit": "ae6a8d9",
+      "periodes": {
+        "donnees": "2026-05-07T00:00:00+00:00",
+        "echantillon": [
+          "2026-05-09T00:00:00+00:00",
+          "2026-09-07T00:00:00+00:00"
+        ],
+        "hors_echantillon": [
+          "2026-09-07T00:00:00+00:00",
+          "2026-11-07T00:00:00+00:00"
+        ]
+      },
+      "intervalle": "5m",
       "statut": "rejetee_en_echantillon",
       "raisons": [
         "aucune combinaison avec ≥ 30 trades et un P&L > 0 en échantillon"
@@ -190,6 +401,20 @@
     {
       "modele": "cassure-range",
       "paire": "SOLUSDT",
+      "etape": "7",
+      "commit": "ae6a8d9",
+      "periodes": {
+        "donnees": "2026-05-07T00:00:00+00:00",
+        "echantillon": [
+          "2026-05-09T00:00:00+00:00",
+          "2026-09-07T00:00:00+00:00"
+        ],
+        "hors_echantillon": [
+          "2026-09-07T00:00:00+00:00",
+          "2026-11-07T00:00:00+00:00"
+        ]
+      },
+      "intervalle": "5m",
       "statut": "rejetee_en_echantillon",
       "raisons": [
         "aucune combinaison avec ≥ 30 trades et un P&L > 0 en échantillon"
@@ -199,6 +424,999 @@
       "trades_hors_echantillon": null,
       "percentile_tirages": null,
       "rapport": "backtests/cassure-range-solusdt.md"
+    },
+    {
+      "modele": "tendance-1h",
+      "paire": "BTCUSDT",
+      "etape": "7b",
+      "commit": "48a90f5",
+      "periodes": {
+        "donnees": "2025-10-16T00:00:00+00:00",
+        "echantillon": [
+          "2025-11-09T00:00:00+00:00",
+          "2026-09-07T00:00:00+00:00"
+        ],
+        "hors_echantillon": [
+          "2026-09-07T00:00:00+00:00",
+          "2026-11-07T00:00:00+00:00"
+        ]
+      },
+      "intervalle": "1h",
+      "statut": "rejetee_en_echantillon",
+      "raisons": [
+        "aucune combinaison avec ≥ 30 trades et un P&L > 0 en échantillon"
+      ],
+      "parametres": null,
+      "pnl_hors_echantillon": null,
+      "trades_hors_echantillon": null,
+      "percentile_tirages": null,
+      "grille_echantillon": [
+        {
+          "parametres": {
+            "objectif.multiple": "2",
+            "croisement_ema.lente": 21
+          },
+          "pnl": "-353.30",
+          "trades": 104,
+          "candidate": false
+        },
+        {
+          "parametres": {
+            "objectif.multiple": "2",
+            "croisement_ema.lente": 30
+          },
+          "pnl": "-162.37",
+          "trades": 86,
+          "candidate": false
+        },
+        {
+          "parametres": {
+            "objectif.multiple": "2",
+            "croisement_ema.lente": 50
+          },
+          "pnl": "-141.22",
+          "trades": 61,
+          "candidate": false
+        },
+        {
+          "parametres": {
+            "objectif.multiple": "3",
+            "croisement_ema.lente": 21
+          },
+          "pnl": "-346.41",
+          "trades": 104,
+          "candidate": false
+        },
+        {
+          "parametres": {
+            "objectif.multiple": "3",
+            "croisement_ema.lente": 30
+          },
+          "pnl": "-214.50",
+          "trades": 86,
+          "candidate": false
+        },
+        {
+          "parametres": {
+            "objectif.multiple": "3",
+            "croisement_ema.lente": 50
+          },
+          "pnl": "-147.17",
+          "trades": 61,
+          "candidate": false
+        },
+        {
+          "parametres": {
+            "objectif.multiple": "4",
+            "croisement_ema.lente": 21
+          },
+          "pnl": "-393.67",
+          "trades": 104,
+          "candidate": false
+        },
+        {
+          "parametres": {
+            "objectif.multiple": "4",
+            "croisement_ema.lente": 30
+          },
+          "pnl": "-275.96",
+          "trades": 86,
+          "candidate": false
+        },
+        {
+          "parametres": {
+            "objectif.multiple": "4",
+            "croisement_ema.lente": 50
+          },
+          "pnl": "-163.68",
+          "trades": 61,
+          "candidate": false
+        }
+      ],
+      "rapport": "backtests/tendance-1h-btcusdt.md"
+    },
+    {
+      "modele": "tendance-1h",
+      "paire": "ETHUSDT",
+      "etape": "7b",
+      "commit": "48a90f5",
+      "periodes": {
+        "donnees": "2025-10-16T00:00:00+00:00",
+        "echantillon": [
+          "2025-11-09T00:00:00+00:00",
+          "2026-09-07T00:00:00+00:00"
+        ],
+        "hors_echantillon": [
+          "2026-09-07T00:00:00+00:00",
+          "2026-11-07T00:00:00+00:00"
+        ]
+      },
+      "intervalle": "1h",
+      "statut": "rejetee_en_echantillon",
+      "raisons": [
+        "aucune combinaison avec ≥ 30 trades et un P&L > 0 en échantillon"
+      ],
+      "parametres": null,
+      "pnl_hors_echantillon": null,
+      "trades_hors_echantillon": null,
+      "percentile_tirages": null,
+      "grille_echantillon": [
+        {
+          "parametres": {
+            "objectif.multiple": "2",
+            "croisement_ema.lente": 21
+          },
+          "pnl": "-488.74",
+          "trades": 124,
+          "candidate": false
+        },
+        {
+          "parametres": {
+            "objectif.multiple": "2",
+            "croisement_ema.lente": 30
+          },
+          "pnl": "-241.01",
+          "trades": 102,
+          "candidate": false
+        },
+        {
+          "parametres": {
+            "objectif.multiple": "2",
+            "croisement_ema.lente": 50
+          },
+          "pnl": "-118.14",
+          "trades": 73,
+          "candidate": false
+        },
+        {
+          "parametres": {
+            "objectif.multiple": "3",
+            "croisement_ema.lente": 21
+          },
+          "pnl": "-461.35",
+          "trades": 124,
+          "candidate": false
+        },
+        {
+          "parametres": {
+            "objectif.multiple": "3",
+            "croisement_ema.lente": 30
+          },
+          "pnl": "-192.64",
+          "trades": 102,
+          "candidate": false
+        },
+        {
+          "parametres": {
+            "objectif.multiple": "3",
+            "croisement_ema.lente": 50
+          },
+          "pnl": "-104.60",
+          "trades": 73,
+          "candidate": false
+        },
+        {
+          "parametres": {
+            "objectif.multiple": "4",
+            "croisement_ema.lente": 21
+          },
+          "pnl": "-432.61",
+          "trades": 124,
+          "candidate": false
+        },
+        {
+          "parametres": {
+            "objectif.multiple": "4",
+            "croisement_ema.lente": 30
+          },
+          "pnl": "-214.34",
+          "trades": 102,
+          "candidate": false
+        },
+        {
+          "parametres": {
+            "objectif.multiple": "4",
+            "croisement_ema.lente": 50
+          },
+          "pnl": "-116.85",
+          "trades": 73,
+          "candidate": false
+        }
+      ],
+      "rapport": "backtests/tendance-1h-ethusdt.md"
+    },
+    {
+      "modele": "tendance-1h",
+      "paire": "SOLUSDT",
+      "etape": "7b",
+      "commit": "48a90f5",
+      "periodes": {
+        "donnees": "2025-10-16T00:00:00+00:00",
+        "echantillon": [
+          "2025-11-09T00:00:00+00:00",
+          "2026-09-07T00:00:00+00:00"
+        ],
+        "hors_echantillon": [
+          "2026-09-07T00:00:00+00:00",
+          "2026-11-07T00:00:00+00:00"
+        ]
+      },
+      "intervalle": "1h",
+      "statut": "rejetee_en_echantillon",
+      "raisons": [
+        "aucune combinaison avec ≥ 30 trades et un P&L > 0 en échantillon"
+      ],
+      "parametres": null,
+      "pnl_hors_echantillon": null,
+      "trades_hors_echantillon": null,
+      "percentile_tirages": null,
+      "grille_echantillon": [
+        {
+          "parametres": {
+            "objectif.multiple": "2",
+            "croisement_ema.lente": 21
+          },
+          "pnl": "-137.26",
+          "trades": 125,
+          "candidate": false
+        },
+        {
+          "parametres": {
+            "objectif.multiple": "2",
+            "croisement_ema.lente": 30
+          },
+          "pnl": "-153.51",
+          "trades": 103,
+          "candidate": false
+        },
+        {
+          "parametres": {
+            "objectif.multiple": "2",
+            "croisement_ema.lente": 50
+          },
+          "pnl": "-152.57",
+          "trades": 86,
+          "candidate": false
+        },
+        {
+          "parametres": {
+            "objectif.multiple": "3",
+            "croisement_ema.lente": 21
+          },
+          "pnl": "-77.26",
+          "trades": 125,
+          "candidate": false
+        },
+        {
+          "parametres": {
+            "objectif.multiple": "3",
+            "croisement_ema.lente": 30
+          },
+          "pnl": "-90.99",
+          "trades": 103,
+          "candidate": false
+        },
+        {
+          "parametres": {
+            "objectif.multiple": "3",
+            "croisement_ema.lente": 50
+          },
+          "pnl": "-109.36",
+          "trades": 86,
+          "candidate": false
+        },
+        {
+          "parametres": {
+            "objectif.multiple": "4",
+            "croisement_ema.lente": 21
+          },
+          "pnl": "-111.14",
+          "trades": 125,
+          "candidate": false
+        },
+        {
+          "parametres": {
+            "objectif.multiple": "4",
+            "croisement_ema.lente": 30
+          },
+          "pnl": "-75.00",
+          "trades": 103,
+          "candidate": false
+        },
+        {
+          "parametres": {
+            "objectif.multiple": "4",
+            "croisement_ema.lente": 50
+          },
+          "pnl": "-239.96",
+          "trades": 86,
+          "candidate": false
+        }
+      ],
+      "rapport": "backtests/tendance-1h-solusdt.md"
+    },
+    {
+      "modele": "cassure-matin",
+      "paire": "BTCUSDT",
+      "etape": "7b",
+      "commit": "48a90f5",
+      "periodes": {
+        "donnees": "2025-10-16T00:00:00+00:00",
+        "echantillon": [
+          "2025-11-09T00:00:00+00:00",
+          "2026-09-07T00:00:00+00:00"
+        ],
+        "hors_echantillon": [
+          "2026-09-07T00:00:00+00:00",
+          "2026-11-07T00:00:00+00:00"
+        ]
+      },
+      "intervalle": "15m",
+      "statut": "rejetee_en_echantillon",
+      "raisons": [
+        "aucune combinaison avec ≥ 30 trades et un P&L > 0 en échantillon"
+      ],
+      "parametres": null,
+      "pnl_hors_echantillon": null,
+      "trades_hors_echantillon": null,
+      "percentile_tirages": null,
+      "grille_echantillon": [
+        {
+          "parametres": {
+            "hauteur_range.min_pct": "1",
+            "objectif.multiple": "1"
+          },
+          "pnl": "-167.96",
+          "trades": 87,
+          "candidate": false
+        },
+        {
+          "parametres": {
+            "hauteur_range.min_pct": "1",
+            "objectif.multiple": "1.5"
+          },
+          "pnl": "-196.71",
+          "trades": 87,
+          "candidate": false
+        },
+        {
+          "parametres": {
+            "hauteur_range.min_pct": "1",
+            "objectif.multiple": "2"
+          },
+          "pnl": "-193.73",
+          "trades": 87,
+          "candidate": false
+        },
+        {
+          "parametres": {
+            "hauteur_range.min_pct": "1.5",
+            "objectif.multiple": "1"
+          },
+          "pnl": "-73.53",
+          "trades": 41,
+          "candidate": false
+        },
+        {
+          "parametres": {
+            "hauteur_range.min_pct": "1.5",
+            "objectif.multiple": "1.5"
+          },
+          "pnl": "-100.80",
+          "trades": 41,
+          "candidate": false
+        },
+        {
+          "parametres": {
+            "hauteur_range.min_pct": "1.5",
+            "objectif.multiple": "2"
+          },
+          "pnl": "-104.99",
+          "trades": 41,
+          "candidate": false
+        },
+        {
+          "parametres": {
+            "hauteur_range.min_pct": "2",
+            "objectif.multiple": "1"
+          },
+          "pnl": "-21.45",
+          "trades": 22,
+          "candidate": false
+        },
+        {
+          "parametres": {
+            "hauteur_range.min_pct": "2",
+            "objectif.multiple": "1.5"
+          },
+          "pnl": "-52.07",
+          "trades": 22,
+          "candidate": false
+        },
+        {
+          "parametres": {
+            "hauteur_range.min_pct": "2",
+            "objectif.multiple": "2"
+          },
+          "pnl": "-65.04",
+          "trades": 22,
+          "candidate": false
+        }
+      ],
+      "rapport": "backtests/cassure-matin-btcusdt.md"
+    },
+    {
+      "modele": "cassure-matin",
+      "paire": "ETHUSDT",
+      "etape": "7b",
+      "commit": "48a90f5",
+      "periodes": {
+        "donnees": "2025-10-16T00:00:00+00:00",
+        "echantillon": [
+          "2025-11-09T00:00:00+00:00",
+          "2026-09-07T00:00:00+00:00"
+        ],
+        "hors_echantillon": [
+          "2026-09-07T00:00:00+00:00",
+          "2026-11-07T00:00:00+00:00"
+        ]
+      },
+      "intervalle": "15m",
+      "statut": "rejetee_en_echantillon",
+      "raisons": [
+        "aucune combinaison avec ≥ 30 trades et un P&L > 0 en échantillon"
+      ],
+      "parametres": null,
+      "pnl_hors_echantillon": null,
+      "trades_hors_echantillon": null,
+      "percentile_tirages": null,
+      "grille_echantillon": [
+        {
+          "parametres": {
+            "hauteur_range.min_pct": "1",
+            "objectif.multiple": "1"
+          },
+          "pnl": "-292.50",
+          "trades": 94,
+          "candidate": false
+        },
+        {
+          "parametres": {
+            "hauteur_range.min_pct": "1",
+            "objectif.multiple": "1.5"
+          },
+          "pnl": "-272.29",
+          "trades": 94,
+          "candidate": false
+        },
+        {
+          "parametres": {
+            "hauteur_range.min_pct": "1",
+            "objectif.multiple": "2"
+          },
+          "pnl": "-260.39",
+          "trades": 94,
+          "candidate": false
+        },
+        {
+          "parametres": {
+            "hauteur_range.min_pct": "1.5",
+            "objectif.multiple": "1"
+          },
+          "pnl": "-200.23",
+          "trades": 53,
+          "candidate": false
+        },
+        {
+          "parametres": {
+            "hauteur_range.min_pct": "1.5",
+            "objectif.multiple": "1.5"
+          },
+          "pnl": "-173.43",
+          "trades": 53,
+          "candidate": false
+        },
+        {
+          "parametres": {
+            "hauteur_range.min_pct": "1.5",
+            "objectif.multiple": "2"
+          },
+          "pnl": "-169.75",
+          "trades": 53,
+          "candidate": false
+        },
+        {
+          "parametres": {
+            "hauteur_range.min_pct": "2",
+            "objectif.multiple": "1"
+          },
+          "pnl": "-61.96",
+          "trades": 24,
+          "candidate": false
+        },
+        {
+          "parametres": {
+            "hauteur_range.min_pct": "2",
+            "objectif.multiple": "1.5"
+          },
+          "pnl": "-45.21",
+          "trades": 24,
+          "candidate": false
+        },
+        {
+          "parametres": {
+            "hauteur_range.min_pct": "2",
+            "objectif.multiple": "2"
+          },
+          "pnl": "-51.90",
+          "trades": 24,
+          "candidate": false
+        }
+      ],
+      "rapport": "backtests/cassure-matin-ethusdt.md"
+    },
+    {
+      "modele": "cassure-matin",
+      "paire": "SOLUSDT",
+      "etape": "7b",
+      "commit": "48a90f5",
+      "periodes": {
+        "donnees": "2025-10-16T00:00:00+00:00",
+        "echantillon": [
+          "2025-11-09T00:00:00+00:00",
+          "2026-09-07T00:00:00+00:00"
+        ],
+        "hors_echantillon": [
+          "2026-09-07T00:00:00+00:00",
+          "2026-11-07T00:00:00+00:00"
+        ]
+      },
+      "intervalle": "15m",
+      "statut": "rejetee_en_echantillon",
+      "raisons": [
+        "aucune combinaison avec ≥ 30 trades et un P&L > 0 en échantillon"
+      ],
+      "parametres": null,
+      "pnl_hors_echantillon": null,
+      "trades_hors_echantillon": null,
+      "percentile_tirages": null,
+      "grille_echantillon": [
+        {
+          "parametres": {
+            "hauteur_range.min_pct": "1",
+            "objectif.multiple": "1"
+          },
+          "pnl": "-201.19",
+          "trades": 102,
+          "candidate": false
+        },
+        {
+          "parametres": {
+            "hauteur_range.min_pct": "1",
+            "objectif.multiple": "1.5"
+          },
+          "pnl": "-168.91",
+          "trades": 102,
+          "candidate": false
+        },
+        {
+          "parametres": {
+            "hauteur_range.min_pct": "1",
+            "objectif.multiple": "2"
+          },
+          "pnl": "-157.57",
+          "trades": 102,
+          "candidate": false
+        },
+        {
+          "parametres": {
+            "hauteur_range.min_pct": "1.5",
+            "objectif.multiple": "1"
+          },
+          "pnl": "-145.73",
+          "trades": 59,
+          "candidate": false
+        },
+        {
+          "parametres": {
+            "hauteur_range.min_pct": "1.5",
+            "objectif.multiple": "1.5"
+          },
+          "pnl": "-113.73",
+          "trades": 59,
+          "candidate": false
+        },
+        {
+          "parametres": {
+            "hauteur_range.min_pct": "1.5",
+            "objectif.multiple": "2"
+          },
+          "pnl": "-79.74",
+          "trades": 59,
+          "candidate": false
+        },
+        {
+          "parametres": {
+            "hauteur_range.min_pct": "2",
+            "objectif.multiple": "1"
+          },
+          "pnl": "-85.70",
+          "trades": 34,
+          "candidate": false
+        },
+        {
+          "parametres": {
+            "hauteur_range.min_pct": "2",
+            "objectif.multiple": "1.5"
+          },
+          "pnl": "-53.38",
+          "trades": 34,
+          "candidate": false
+        },
+        {
+          "parametres": {
+            "hauteur_range.min_pct": "2",
+            "objectif.multiple": "2"
+          },
+          "pnl": "-41.98",
+          "trades": 34,
+          "candidate": false
+        }
+      ],
+      "rapport": "backtests/cassure-matin-solusdt.md"
+    },
+    {
+      "modele": "repli-tendance",
+      "paire": "BTCUSDT",
+      "etape": "7b",
+      "commit": "48a90f5",
+      "periodes": {
+        "donnees": "2025-10-16T00:00:00+00:00",
+        "echantillon": [
+          "2025-11-09T00:00:00+00:00",
+          "2026-09-07T00:00:00+00:00"
+        ],
+        "hors_echantillon": [
+          "2026-09-07T00:00:00+00:00",
+          "2026-11-07T00:00:00+00:00"
+        ]
+      },
+      "intervalle": "15m",
+      "statut": "donnees_insuffisantes",
+      "raisons": [
+        "5 trades hors échantillon (minimum 30)"
+      ],
+      "parametres": {
+        "entree.rsi_extreme.seuil": "35",
+        "objectif.valeur": "1"
+      },
+      "pnl_hors_echantillon": "-8.93",
+      "trades_hors_echantillon": 5,
+      "percentile_tirages": 59.0,
+      "grille_echantillon": [
+        {
+          "parametres": {
+            "entree.rsi_extreme.seuil": "35",
+            "objectif.valeur": "1"
+          },
+          "pnl": "0.49",
+          "trades": 37,
+          "candidate": true
+        },
+        {
+          "parametres": {
+            "entree.rsi_extreme.seuil": "35",
+            "objectif.valeur": "1.5"
+          },
+          "pnl": "-42.97",
+          "trades": 36,
+          "candidate": false
+        },
+        {
+          "parametres": {
+            "entree.rsi_extreme.seuil": "35",
+            "objectif.valeur": "2"
+          },
+          "pnl": "-57.41",
+          "trades": 35,
+          "candidate": false
+        },
+        {
+          "parametres": {
+            "entree.rsi_extreme.seuil": "40",
+            "objectif.valeur": "1"
+          },
+          "pnl": "-126.55",
+          "trades": 110,
+          "candidate": false
+        },
+        {
+          "parametres": {
+            "entree.rsi_extreme.seuil": "40",
+            "objectif.valeur": "1.5"
+          },
+          "pnl": "-120.69",
+          "trades": 105,
+          "candidate": false
+        },
+        {
+          "parametres": {
+            "entree.rsi_extreme.seuil": "40",
+            "objectif.valeur": "2"
+          },
+          "pnl": "-119.16",
+          "trades": 102,
+          "candidate": false
+        },
+        {
+          "parametres": {
+            "entree.rsi_extreme.seuil": "45",
+            "objectif.valeur": "1"
+          },
+          "pnl": "-415.64",
+          "trades": 189,
+          "candidate": false
+        },
+        {
+          "parametres": {
+            "entree.rsi_extreme.seuil": "45",
+            "objectif.valeur": "1.5"
+          },
+          "pnl": "-363.15",
+          "trades": 176,
+          "candidate": false
+        },
+        {
+          "parametres": {
+            "entree.rsi_extreme.seuil": "45",
+            "objectif.valeur": "2"
+          },
+          "pnl": "-384.32",
+          "trades": 169,
+          "candidate": false
+        }
+      ],
+      "rapport": "backtests/repli-tendance-btcusdt.md"
+    },
+    {
+      "modele": "repli-tendance",
+      "paire": "ETHUSDT",
+      "etape": "7b",
+      "commit": "48a90f5",
+      "periodes": {
+        "donnees": "2025-10-16T00:00:00+00:00",
+        "echantillon": [
+          "2025-11-09T00:00:00+00:00",
+          "2026-09-07T00:00:00+00:00"
+        ],
+        "hors_echantillon": [
+          "2026-09-07T00:00:00+00:00",
+          "2026-11-07T00:00:00+00:00"
+        ]
+      },
+      "intervalle": "15m",
+      "statut": "rejetee_en_echantillon",
+      "raisons": [
+        "aucune combinaison avec ≥ 30 trades et un P&L > 0 en échantillon"
+      ],
+      "parametres": null,
+      "pnl_hors_echantillon": null,
+      "trades_hors_echantillon": null,
+      "percentile_tirages": null,
+      "grille_echantillon": [
+        {
+          "parametres": {
+            "entree.rsi_extreme.seuil": "35",
+            "objectif.valeur": "1"
+          },
+          "pnl": "-84.31",
+          "trades": 53,
+          "candidate": false
+        },
+        {
+          "parametres": {
+            "entree.rsi_extreme.seuil": "35",
+            "objectif.valeur": "1.5"
+          },
+          "pnl": "-92.47",
+          "trades": 52,
+          "candidate": false
+        },
+        {
+          "parametres": {
+            "entree.rsi_extreme.seuil": "35",
+            "objectif.valeur": "2"
+          },
+          "pnl": "-76.43",
+          "trades": 52,
+          "candidate": false
+        },
+        {
+          "parametres": {
+            "entree.rsi_extreme.seuil": "40",
+            "objectif.valeur": "1"
+          },
+          "pnl": "-300.88",
+          "trades": 142,
+          "candidate": false
+        },
+        {
+          "parametres": {
+            "entree.rsi_extreme.seuil": "40",
+            "objectif.valeur": "1.5"
+          },
+          "pnl": "-320.36",
+          "trades": 137,
+          "candidate": false
+        },
+        {
+          "parametres": {
+            "entree.rsi_extreme.seuil": "40",
+            "objectif.valeur": "2"
+          },
+          "pnl": "-328.95",
+          "trades": 135,
+          "candidate": false
+        },
+        {
+          "parametres": {
+            "entree.rsi_extreme.seuil": "45",
+            "objectif.valeur": "1"
+          },
+          "pnl": "-472.09",
+          "trades": 265,
+          "candidate": false
+        },
+        {
+          "parametres": {
+            "entree.rsi_extreme.seuil": "45",
+            "objectif.valeur": "1.5"
+          },
+          "pnl": "-407.05",
+          "trades": 242,
+          "candidate": false
+        },
+        {
+          "parametres": {
+            "entree.rsi_extreme.seuil": "45",
+            "objectif.valeur": "2"
+          },
+          "pnl": "-325.54",
+          "trades": 236,
+          "candidate": false
+        }
+      ],
+      "rapport": "backtests/repli-tendance-ethusdt.md"
+    },
+    {
+      "modele": "repli-tendance",
+      "paire": "SOLUSDT",
+      "etape": "7b",
+      "commit": "48a90f5",
+      "periodes": {
+        "donnees": "2025-10-16T00:00:00+00:00",
+        "echantillon": [
+          "2025-11-09T00:00:00+00:00",
+          "2026-09-07T00:00:00+00:00"
+        ],
+        "hors_echantillon": [
+          "2026-09-07T00:00:00+00:00",
+          "2026-11-07T00:00:00+00:00"
+        ]
+      },
+      "intervalle": "15m",
+      "statut": "rejetee_en_echantillon",
+      "raisons": [
+        "aucune combinaison avec ≥ 30 trades et un P&L > 0 en échantillon"
+      ],
+      "parametres": null,
+      "pnl_hors_echantillon": null,
+      "trades_hors_echantillon": null,
+      "percentile_tirages": null,
+      "grille_echantillon": [
+        {
+          "parametres": {
+            "entree.rsi_extreme.seuil": "35",
+            "objectif.valeur": "1"
+          },
+          "pnl": "-21.81",
+          "trades": 64,
+          "candidate": false
+        },
+        {
+          "parametres": {
+            "entree.rsi_extreme.seuil": "35",
+            "objectif.valeur": "1.5"
+          },
+          "pnl": "-106.39",
+          "trades": 60,
+          "candidate": false
+        },
+        {
+          "parametres": {
+            "entree.rsi_extreme.seuil": "35",
+            "objectif.valeur": "2"
+          },
+          "pnl": "-111.15",
+          "trades": 59,
+          "candidate": false
+        },
+        {
+          "parametres": {
+            "entree.rsi_extreme.seuil": "40",
+            "objectif.valeur": "1"
+          },
+          "pnl": "-482.02",
+          "trades": 153,
+          "candidate": false
+        },
+        {
+          "parametres": {
+            "entree.rsi_extreme.seuil": "40",
+            "objectif.valeur": "1.5"
+          },
+          "pnl": "-460.87",
+          "trades": 140,
+          "candidate": false
+        },
+        {
+          "parametres": {
+            "entree.rsi_extreme.seuil": "40",
+            "objectif.valeur": "2"
+          },
+          "pnl": "-513.96",
+          "trades": 133,
+          "candidate": false
+        },
+        {
+          "parametres": {
+            "entree.rsi_extreme.seuil": "45",
+            "objectif.valeur": "1"
+          },
+          "pnl": "-635.26",
+          "trades": 299,
+          "candidate": false
+        },
+        {
+          "parametres": {
+            "entree.rsi_extreme.seuil": "45",
+            "objectif.valeur": "1.5"
+          },
+          "pnl": "-516.51",
+          "trades": 271,
+          "candidate": false
+        },
+        {
+          "parametres": {
+            "entree.rsi_extreme.seuil": "45",
+            "objectif.valeur": "2"
+          },
+          "pnl": "-425.14",
+          "trades": 262,
+          "candidate": false
+        }
+      ],
+      "rapport": "backtests/repli-tendance-solusdt.md"
     }
   ]
 }

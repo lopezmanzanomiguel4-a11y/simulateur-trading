@@ -16,7 +16,8 @@ from simtrade.catalogue import Couple
 from simtrade.errors import InvalidInput
 
 NEW = ("tendance-1h", "cassure-matin", "repli-tendance")
-REPO_CATALOGUE = Path(catalogue.__file__).resolve().parent / "catalogue.json"
+# Catalogue de l'étape 7 (format 1), copié du commit 335ef1b : le catalogue du dépôt est désormais au format 2.
+REPO_CATALOGUE = Path(__file__).resolve().parent / "data" / "catalogue-etape7.json"
 
 
 def view(candles, candles_1m=(), now=None):
