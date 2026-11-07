@@ -379,9 +379,9 @@ Paramètre invalide (intervalle ou ancrage inconnu, entier ou booléen illisible
 
 ### Bougies, journal et statistiques
 
-**Bougies sauvegardées** (`marche.db`) : base SQLite **séparée** de la base de trading, dans le même dossier (donc dans le dossier temporaire si `SIMTRADE_DB` y pointe), ou là où pointe `SIMTRADE_MARCHE_DB`. Elle ne contient que des klines **1m définitives** (ouverture, haut, bas, clôture, volume, notional, nombre de transactions), une ligne par paire et par minute : réenregistrer la même kline ne crée pas de doublon. Les bougies 5m et 15m sont agrégées depuis les 1m (ouverture de la première minute, plus haut et plus bas, clôture de la dernière, sommes du volume, du notional et des transactions) ; s'il leur manque une minute, elles sont marquées `complete: false`.
+**Bougies sauvegardées** (`marche.db`) : base SQLite **séparée** de la base de trading, dans le même dossier (donc dans le dossier temporaire si `SIMTRADE_DB` y pointe), ou là où pointe `SIMTRADE_MARCHE_DB`. Elle ne contient que des klines **1m définitives** (ouverture, haut, bas, clôture, volume, notional, nombre de transactions), une ligne par paire et par minute : réenregistrer la même kline ne crée pas de doublon. Les bougies 5m et 15m n'y sont pas stockées : `market.aggregate` les reconstitue depuis les 1m pour le backtest (ouverture de la première minute, plus haut et plus bas, clôture de la dernière, sommes du volume, du notional et des transactions) ; s'il leur manque une minute, elles sont marquées `complete: false`.
 - **En live**, l'API enregistre chaque bougie 1m dès qu'elle est remplacée par sa kline (ainsi que les klines 1m clôturées du préchargement), dans le thread SQLite : la boucle asyncio ne touche jamais la base.
-- **Téléchargement** (`marche telecharger`, CLI seulement) : klines publiques Binance, pages de 1 000 minutes enregistrées une à une ; la commande suivante reprend après la dernière minute enregistrée. Les trous (minutes absentes chez Binance) sont rapportés, pas comblés. Le poids utilisé est lu dans l'en-tête `X-MBX-USED-WEIGHT-1M` : au-delà de 4 800 (sur 6 000 par minute), attente de la minute suivante ; sur une réponse 429 ou 418, attente de `Retry-After` (60 s par défaut) puis nouvel essai de la même page. Refus avant tout téléchargement si l'espace libre estimé après coup (200 octets par ligne) tombe sous 5 Go.
+- **Téléchargement** (`marche telecharger`, CLI seulement) : klines publiques Binance, pages de 1 000 minutes enregistrées une à une ; la commande suivante reprend après la dernière minute enregistrée. Les trous (minutes absentes chez Binance) sont rapportés, pas comblés. Le poids utilisé est lu dans l'en-tête `X-MBX-USED-WEIGHT-1M` : dès 4 800 (sur 6 000 par minute), attente de la minute suivante ; sur une réponse 429 ou 418, attente de `Retry-After` (60 s par défaut) puis nouvel essai de la même page. Refus avant tout téléchargement si l'espace libre estimé après coup (200 octets par ligne) tombe sous 5 Go.
 
 **Trade** (aller-retour) : reconstitué depuis les ordres, de la position nulle à la position nulle sur une paire (renforts et ventes partielles compris). Motif de sortie, d'après le dernier ordre de vente : `stop`, `objectif`, `cloture_session` (clôture de session, tardive ou non), `signal` (vente liée à un signal de sortie), sinon `manuel`. Stratégie : celle du signal d'entrée lié au premier achat. P&L net des deux frais, avec $C$ le coût des achats (frais inclus) et $P$ le produit des ventes (frais déduits) :
 
@@ -389,7 +389,7 @@ $$\text{PnL}_{\text{trade}} = P - C$$
 
 **Journal** (`/journal`, `journal`) : signaux, refus du garde-fou, ordres et trades d'un compte, dans l'ordre chronologique ; à heure égale, la décision avant son effet (signal, refus, ordre, trade).
 
-**Courbe de valeur** $V_m$ : valeur du compte à la fin de chaque minute $m$, solde plus positions marquées au bid. Le bid passé n'étant pas enregistré, il est estimé depuis la clôture 1m $c_{i,m}$ de chaque paire $i$ et un spread fixe $s = 0{,}02\,\%$ (même convention que le backtest) ; une minute absente de `marche.db` reprend le dernier prix connu et est comptée (`minutes_sans_bougie`) :
+**Courbe de valeur** $V_m$ : valeur du compte à la fin de chaque minute $m$, solde plus positions marquées au bid. Le bid passé n'étant pas enregistré, il est estimé depuis la clôture 1m $c_{i,m}$ de chaque paire $i$ et un spread fixe $s = 0{,}02\,\%$ (même convention que le backtest) ; une minute absente de `marche.db` reprend le dernier prix connu ; `minutes_sans_bougie` compte ces minutes quand une position est ouverte (une fois par paire concernée) :
 
 $$V_m = \text{solde}_m + \sum_i q_{i,m}\, c_{i,m} \left(1 - \frac{s}{2}\right)$$
 
@@ -404,7 +404,7 @@ $$V_m = \text{solde}_m + \sum_i q_{i,m}\, c_{i,m} \left(1 - \frac{s}{2}\right)$$
 | Frais payés | somme des frais des ordres de la période |
 | Sharpe | $\dfrac{\bar r}{\sigma_r}\sqrt{365}$, taux sans risque nul |
 
-Pour le Sharpe, $r_d = \dfrac{V_d}{V_{d-1}} - 1$ est le rendement de chaque session (jour UTC) de la période, avec $V_d$ la valeur en fin de jour ($V_0$ avant le premier) : un jour sans trade a un rendement nul et compte quand même. $\bar r$ est la moyenne et $\sigma_r$ l'écart type (dénominateur $N - 1$) des $N$ rendements. `null` sous 2 sessions ou si $\sigma_r = 0$. Le nombre de sessions (`sessions`) est toujours affiché. Le même module (`stats.py`) servira au backtest.
+Pour le Sharpe, $r_d = \dfrac{V_d}{V_{d-1}} - 1$ est le rendement de chaque session (jour UTC) de la période, avec $V_d$ la valeur en fin de jour ($V_0$ avant le premier) : un jour sans trade ni position a un rendement nul et compte quand même. $\bar r$ est la moyenne et $\sigma_r$ l'écart type (dénominateur $N - 1$) des $N$ rendements. `null` sous 2 sessions ou si $\sigma_r = 0$. Le nombre de sessions (`sessions`) est toujours affiché. Le même module (`stats.py`) servira au backtest.
 
 ## Tests
 
