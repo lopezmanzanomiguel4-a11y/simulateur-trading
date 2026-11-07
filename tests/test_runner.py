@@ -381,7 +381,7 @@ def test_backtest_identique_au_live(m):
     live_orders = m.service.history(compte="robot")[1]
     key = lambda o: (o.side, o.kind, o.price, o.quantity, o.created_at.replace(second=0))  # live T+3 s, backtest T+1 s
     assert [key(o) for o in result.orders] == [key(o) for o in live_orders]
-    assert len(live_orders) >= 2 and all(o.kind == MARKET for o in live_orders)  # entrées et sorties sur signal
+    assert len(live_orders) == 6 and all(o.kind == MARKET for o in live_orders)  # 3 allers-retours, entrées et sorties sur signal
     live_trades = trades.trades_from_orders(live_orders, trades.links_from_signals(m.service.signals()))
     assert [t.exit_reason for t in result.trades] == [t.exit_reason for t in live_trades]
     assert [t.pnl for t in result.trades] == [t.pnl for t in live_trades]

@@ -95,7 +95,7 @@ python -m simtrade journal -c robot                     # signaux, refus, ordres
 python -m simtrade stats -c robot                       # P&L, drawdown, réussite, Sharpe... (--strategie, --depuis, --jusqu-a)
 ```
 
-Backtest et catalogue (lisent `marche.db`, sans réseau) :
+Backtest et catalogue (sans réseau ; `backtest` et `catalogue construire` lisent `marche.db`, `catalogue` lit `catalogue.json`) :
 
 ```powershell
 python -m simtrade backtest retour-vwap --paire ETHUSDT --depuis 2026-06-01 --jusqu-a 2026-06-08
@@ -428,13 +428,13 @@ $$\text{ask} = o\left(1 + \frac{s}{2}\right) \qquad \text{bid} = o\left(1 - \fra
 - perte max de session vérifiée au plus bas de chaque minute en position, au bid estimé $l\left(1 - \frac{s}{2}\right)$, et après chaque vente ;
 - trou dans la fenêtre (minute absente, bougie incomplète, historique plus court que celui du live) : signal ignoré (`historique_partiel`) ; minute d'exécution absente : `pas_de_cotation_fraiche`.
 
-**Références**, sur les mêmes données et avec la même taille de position : ne rien faire ; acheter à 00:00 et vendre à la clôture de session, chaque jour, sans stop ; entrées au hasard. Pour ces dernières, chaque clôture éligible (sans position, heures actives, avant la dernière entrée, sans trou) donne une entrée avec la probabilité $p = \dfrac{\text{entrées de la stratégie}}{\text{clôtures éligibles}}$, puis le même calcul du stop et de l'objectif, les mêmes sorties et le même garde-fou ; 100 tirages, graines 1 à 100.
+**Références**, sur les mêmes données et avec la même taille de position : ne rien faire ; acheter à 00:00 et vendre à la clôture de session, chaque jour, sans stop ; entrées au hasard. Pour ces dernières, chaque clôture éligible (sans position, heures actives, avant la dernière entrée, session non arrêtée, sans trou, VWAP fiable) donne une entrée avec la probabilité $p = \dfrac{\text{entrées de la stratégie}}{\text{clôtures éligibles}}$, puis le même calcul du stop et de l'objectif, les mêmes sorties et le même garde-fou ; 100 tirages, graines 1 à 100.
 
 **Régimes** (`regimes.py`, bougies 5m clôturées seulement), sur les 100 dernières bougies : ATR de Wilder sur 14 bougies en % de la clôture, et ratio d'efficacité sur 24 bougies :
 
 $$\text{ER}_T = \frac{|c_T - c_{T-24}|}{\sum_{t=T-23}^{T} |c_t - c_{t-1}|}$$
 
-`forte_volatilite` si l'ATR % atteint le quantile 80 % de l'échantillon (par paire) ; sinon `tendance` si l'ER atteint son quantile 70 % ; sinon `range`. Le régime de chaque trade est celui de son entrée.
+`forte_volatilite` si l'ATR % atteint le quantile 80 % calculé sur les bougies 5m du 07/05 au 07/09 (échantillon et ses deux jours de fenêtre), par paire ; sinon `tendance` si l'ER atteint son quantile 70 % ; sinon `range`. Le régime de chaque trade est celui de son entrée.
 
 **Catalogue** (`catalogue construire`, règles figées avant tout calcul) :
 - données du 07/05 au 07/11/2026 ; échantillon du 09/05 au 07/09 (les deux premiers jours remplissent la fenêtre du live), hors échantillon du 07/09 au 07/11 ; intervalle 5m ; BTC, ETH, SOL ;
@@ -515,7 +515,7 @@ L'API ne fait qu'appeler `TradingService`, qui reçoit un `CachedFeed` à la pla
 - **Coinbase en secours est moins liquide en USDT** : le spread BTC-USDT y est nettement plus large que sur Binance (constaté : environ 3,5 pb contre moins de 0,01 pb), et le canal ticker ne se met à jour qu'à chaque transaction.
 - CLI : pas de reconnexion automatique si le flux continu `prix` est coupé en cours de route (l'API, elle, se reconnecte).
 - **Backtest : spread fixe** ($s = 0{,}02\,\%$, sensibilité à 0,05 %), carnet d'ordres ignoré, exécution complète au prix simulé. Le chemin du prix à l'intérieur d'une minute est inconnu : stop et objectif exécutés à leur niveau exact, stop retenu quand les deux sont touchés.
-- **Tests multiples** : 9 couples modèle-paire testés hors échantillon au seuil de 10 % face aux tirages au hasard peuvent donner environ un faux positif par hasard. Une stratégie admise n'est pas une stratégie gagnante garantie ; le percentile exact est publié.
+- **Tests multiples** : jusqu'à 9 couples modèle-paire testés hors échantillon (ceux qui ont une candidate en échantillon) au seuil de 10 % face aux tirages au hasard peuvent donner environ un faux positif par hasard. Une stratégie admise n'est pas une stratégie gagnante garantie ; le percentile exact est publié.
 - **Un seul découpage échantillon / hors échantillon** (2 mois hors échantillon) : peu de trades par régime, résultats sensibles à la période.
 - **Bougies en mémoire rechargées au démarrage** : l'API recharge 1 journée en 1m et 500 bougies au-delà depuis Binance à chaque démarrage. Seules les 1m définitives sont sauvegardées (`marche.db`) ; une minute où l'API ne tournait pas manque, sauf à la télécharger ensuite (`marche telecharger`).
 - **Courbe de valeur au bid estimé** (clôture 1m × (1 − s/2), s = 0,02 %), pas au vrai bid du moment, qui n'est pas enregistré.
