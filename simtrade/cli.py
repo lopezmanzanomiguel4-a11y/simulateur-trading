@@ -171,6 +171,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("action", nargs="?", choices=("afficher", "construire"), default="afficher")
     p.add_argument("--processus", type=int, help="processus de calcul (défaut : cœurs - 1, au plus 11)")
     p.add_argument("--sortie", help="dossier de sortie (catalogue.json et backtests/) ; défaut : le dépôt")
+    p.add_argument("--etape", choices=("7", "7b"), default="7b",
+                   help="modèles et périodes construits (défaut 7b) ; les résultats des autres étapes sont gardés")
 
     sub.add_parser("info", help="chemin de la base et comptes enregistrés")
     sub.add_parser("api", help="lance l'API HTTP sur http://127.0.0.1:8000 (exécute les ordres en attente)")
@@ -860,16 +862,19 @@ def cmd_catalogue(service: TradingService, args: argparse.Namespace) -> int:
         print(f"Aucun catalogue ({path}) : python -m simtrade catalogue construire.")
         return 0
     data = json.loads(path.read_text(encoding="utf-8"))
-    p = data["periodes"]
-    print(f"Catalogue du {data['cree_le'][:16]} (commit {data.get('commit') or '?'}), hors échantillon "
-          f"{p['hors_echantillon'][0][:10]} → {p['hors_echantillon'][1][:10]}")
+    builds = data.get("constructions") or [data]  # format 1 : une seule construction, au premier niveau
+    for c in builds:
+        p = c["periodes"]
+        step = f"étape {c['etape']} : " if "etape" in c else ""
+        print(f"{step}catalogue du {c['cree_le'][:16]} (commit {c.get('commit') or '?'}), hors échantillon "
+              f"{p['hors_echantillon'][0][:10]} → {p['hors_echantillon'][1][:10]}")
     rows = []
     for r in data["resultats"]:
         trades = r["trades_hors_echantillon"]
         pct = r["percentile_tirages"]
-        rows.append((r["modele"], r["paire"], r["statut"], r["pnl_hors_echantillon"] or "-",
+        rows.append((r["modele"], r["paire"], r.get("intervalle", "5m"), r["statut"], r["pnl_hors_echantillon"] or "-",
                      "-" if trades is None else str(trades), "-" if pct is None else f"{pct:.0f}"))
-    print(table(["Modèle", "Paire", "Statut", "P&L hors éch.", "Trades", "Percentile"], rows, left=3))
+    print(table(["Modèle", "Paire", "Int.", "Statut", "P&L hors éch.", "Trades", "Percentile"], rows, left=4))
     print(f"Stratégies admises : {len(data['entrees'])}" + (" (catalogue vide)" if not data["entrees"] else ""))
     for e in data["entrees"]:
         flag = ", fragile au spread" if e.get("fragile_spread") else ""
@@ -887,7 +892,7 @@ def _build_catalogue(service: TradingService, args: argparse.Namespace) -> int:
     from simtrade.errors import InvalidInput
 
     store = service.market_store()
-    periods = catalogue.DEFAULT_PERIODS
+    grid, periods, _ = catalogue.FAMILIES[args.etape]
     for pair in PAIRS:
         bounds = store.bounds(pair)
         if bounds is None or bounds[0] > periods.data_start or bounds[1] < periods.end - timedelta(minutes=1):
@@ -906,13 +911,13 @@ def _build_catalogue(service: TradingService, args: argparse.Namespace) -> int:
     cat_path = out / "catalogue.json" if out else CATALOGUE_PATH
     reports = out / "backtests" if out else repo / "backtests"
     processes = args.processus or catalogue.default_processes()
-    print(f"Construction du catalogue : {processes} processus, bougies {store.path}, sortie {cat_path} et {reports}",
-          flush=True)
-    b = catalogue.build(catalogue.StoreLoader(str(store.path)), processes=processes, commit=commit,
-                        progress=lambda m: print("  " + m, flush=True))
+    print(f"Construction du catalogue (étape {args.etape} : {', '.join(grid)}) : {processes} processus, "
+          f"bougies {store.path}, sortie {cat_path} et {reports}", flush=True)
+    b = catalogue.build(catalogue.StoreLoader(str(store.path)), periods=periods, models=tuple(grid),
+                        processes=processes, commit=commit, progress=lambda m: print("  " + m, flush=True))
     data = catalogue.write(b, cat_path, reports)
-    print(f"Terminé : {len(data['entrees'])} stratégie(s) admise(s) sur {len(data['resultats'])} ; "
-          + catalogue.durations(b))
+    print(f"Terminé : {len(b.admitted)} stratégie(s) admise(s) sur {len(b.couples)} (catalogue : "
+          f"{len(data['entrees'])} sur {len(data['resultats'])}) ; " + catalogue.durations(b))
     return 0
 
 

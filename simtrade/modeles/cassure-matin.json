@@ -1,0 +1,16 @@
+{
+  "nom": "cassure-matin",
+  "paire": "BTCUSDT",
+  "intervalle": "15m",
+  "entree": [
+    {"brique": "cassure_range", "debut": "00:00", "minutes": 480},
+    {"brique": "hauteur_range", "min_pct": "1.5"}
+  ],
+  "sortie": [
+    {"brique": "retour_dans_range"}
+  ],
+  "stop": {"type": "range", "marge_pct": "0.05"},
+  "objectif": {"type": "r", "multiple": "1.5"},
+  "taille": {"pct_capital": "10"},
+  "heures_actives": {"debut": "08:00", "fin": "20:00"}
+}

@@ -31,7 +31,7 @@ from simtrade.models import PAIRS
 from simtrade.sessions import SessionRules, entry_allowed, parse_hhmm
 
 MODELS_DIR = Path(__file__).parent / "modeles"
-INTERVALS = ("5m", "15m")
+INTERVALS = ("5m", "15m", "1h")
 TICK = Decimal("0.01")  # pas de prix des trois paires
 HUNDRED = Decimal(100)
 # Objectif minimum : frais aller-retour (2 x 0,1 %) + marge de 0,10 % (spread, glissement).
@@ -103,13 +103,16 @@ BRICKS: dict[str, dict[str, Param]] = {
     "croisement_ema": {"sens": _choice("haussier", "baissier"), "rapide": _int(3, 50, 9), "lente": _int(10, 200, 21)},
     "ecart_vwap": {"cote": _choice("sous", "dessus"), "seuil_pct": _dec("0.1", "3", "0.6")},
     "au_dessus_vwap": {},
-    "cassure_range": {"debut": _hour("00:00", "20:00", "00:00"), "minutes": _int(15, 120, 30)},
+    "cassure_range": {"debut": _hour("00:00", "20:00", "00:00"), "minutes": _int(15, 480, 30)},
     "volatilite": {"n": _int(5, 50, 14), "min_pct": _dec("0.05", "2", "0.10"), "max_pct": _dec("0.2", "5", "1.50")},
+    "au_dessus_ema": {"n": _int(20, 300, 200)},
+    "hauteur_range": {"min_pct": _dec("0.1", "5", "1")},
     "retour_vwap": {},
     "retour_dans_range": {},
     "duree_max": {"bougies": _int(1, 96, 12)},
 }
-ENTRY_BRICKS = ("rsi_extreme", "croisement_ema", "ecart_vwap", "au_dessus_vwap", "cassure_range", "volatilite")
+ENTRY_BRICKS = ("rsi_extreme", "croisement_ema", "ecart_vwap", "au_dessus_vwap", "cassure_range", "volatilite",
+                "au_dessus_ema", "hauteur_range")
 EXIT_BRICKS = ("rsi_extreme", "croisement_ema", "retour_vwap", "retour_dans_range", "duree_max")
 # Défaut propre au côté : on entre sur un RSI bas / un croisement haussier, on sort sur l'inverse.
 SIDE_DEFAULTS = {"sortie": {"rsi_extreme": {"zone": "haut"}, "croisement_ema": {"sens": "baissier"}}}
@@ -315,6 +318,8 @@ def validate(raw: Any) -> Strategy:
     has_range = any(b.name == "cassure_range" for b in entry)
     if stop.name == "range" and not has_range:
         raise _err("stop.type", "'range' demande la brique cassure_range dans l'entrée.")
+    if any(b.name == "hauteur_range" for b in entry) and not has_range:
+        raise _err("entree.hauteur_range", "demande la brique cassure_range dans l'entrée.")
     if any(b.name == "retour_dans_range" for b in exits) and not has_range:
         raise _err("sortie.retour_dans_range", "demande la brique cassure_range dans l'entrée.")
     size = _params(GROUPS["taille"], _mapping(raw.get("taille", {}), "taille"), "taille")
@@ -407,7 +412,7 @@ class Evaluation:
 
 def _run(brick: Brick, view: MarketView, entered_at: datetime | None, strategy: Strategy) -> BrickResult:
     params = dict(brick.params)
-    if brick.name == "retour_dans_range":
+    if brick.name in ("retour_dans_range", "hauteur_range"):
         params.update(strategy.brick("cassure_range").params)  # type: ignore[union-attr]
     if brick.name == "duree_max":
         return bricks.duree_max(view, params, entered_at)

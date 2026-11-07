@@ -100,7 +100,7 @@ Backtest et catalogue (sans réseau ; `backtest` et `catalogue construire` lisen
 ```powershell
 python -m simtrade backtest retour-vwap --paire ETHUSDT --depuis 2026-06-01 --jusqu-a 2026-06-08
 python -m simtrade backtest retour-vwap ecart_vwap.seuil_pct=0.4 rsi_extreme.seuil=25 --depuis 2026-06-01 --jusqu-a 2026-06-08 --spread 0.05
-python -m simtrade catalogue construire                 # grille, sélection, hors échantillon, catalogue.json et backtests/ (--processus, --sortie)
+python -m simtrade catalogue construire                 # grille, sélection, hors échantillon, catalogue.json et backtests/ (--etape 7|7b, défaut 7b ; --processus, --sortie)
 python -m simtrade catalogue                            # résultats du catalogue
 ```
 
@@ -259,6 +259,18 @@ $$d_o \ge 2f \times 100 + \text{spread}_\% + 0{,}10 = 0{,}30 + \text{spread}_\% 
 | Objectif | 2 R | 2 R | 1,5 R |
 | Sortie sur signal | `retour_vwap` OU `duree_max` 12 | `croisement_ema` baissier 9/21 | `retour_dans_range` OU `duree_max` 24 |
 | Heures actives (UTC) | 06:00–22:00 | 06:00–22:00 | 00:30–22:00 |
+
+**Modèles à faible fréquence** (étape 7b, objectif visé ≥ 1 %, long uniquement) :
+
+| | `tendance-1h` (1h) | `cassure-matin` (15m) | `repli-tendance` (15m) |
+|---|---|---|---|
+| Entrée | `croisement_ema` haussier 9/21 ET `volatilite` 0,5–3 % | `cassure_range` (00:00, 480 min) ET `hauteur_range` ≥ 1,5 % | `au_dessus_ema` 200 ET `rsi_extreme` bas 30 ET `volatilite` 0,25–2 % |
+| Stop | 1,5 × ATR14 | bas du range − 0,05 % | 2 × ATR14 |
+| Objectif | 3 × ATR14 | 1,5 R | 1,5 % |
+| Sortie sur signal | `croisement_ema` baissier 9/21 | `retour_dans_range` | `rsi_extreme` haut 70 OU `duree_max` 32 |
+| Heures actives (UTC) | 01:00–22:00 | 08:00–20:00 | 02:00–22:00 |
+
+Briques ajoutées : `au_dessus_ema` (`n` 20–300, défaut 200 : dernière clôture au-dessus de l'EMA `n` de l'intervalle) et `hauteur_range` (`min_pct` 0,1–5 % : hauteur du range de `cassure_range`, $h = \frac{\text{haut} - \text{bas}}{\text{haut}} \times 100$, au moins `min_pct`). `cassure_range.minutes` va jusqu'à 480.
 
 **Exécution** (`runner.py`, une vérification par seconde dans l'API) :
 - seule la **dernière bougie clôturée** de l'intervalle est évaluée, une fois, quand elle est **définitive** : remplacée par sa kline Binance, ainsi que les bougies 1m qui la composent (2 à 7 s après la clôture en général). Au-delà de 20 s sans kline, un signal est ignoré (`bougie_non_definitive`). La vue est datée de la clôture de la bougie : le même code (`strategies.evaluate`) servira au backtest ;
@@ -444,6 +456,8 @@ $$\text{ER}_T = \frac{|c_T - c_{T-24}|}{\sum_{t=T-23}^{T} |c_t - c_{t-1}|}$$
 - hors échantillon, lancé une seule fois : la stratégie, la même à $s = 0{,}05\,\%$ (sensibilité), et les références. Admission : P&L > 0, P&L supérieur à l'achat 00:00 / vente clôture, meilleur qu'au moins 90 % des tirages, au moins 30 trades (sinon « données insuffisantes »). Le percentile exact atteint face aux tirages est enregistré. Une stratégie admise dont le P&L est ≤ 0 à 0,05 % porte `"fragile_spread": true` ;
 - régimes retenus pour une stratégie : P&L par trade > 0 avec au moins 20 trades dans ce régime en échantillon ;
 - sorties : `simtrade/catalogue.json` (chaque entrée passe `strategies.validate`, bornes comprises dans le schéma) et un rapport Markdown par couple dans `backtests/`, plus `backtests/synthese.md`. Un catalogue vide est un résultat valide.
+
+**Étape 7b** (`catalogue construire --etape 7b`, mêmes règles) : données du 16/10/2025 au 07/11/2026 (la fenêtre du live en 1h couvre ≈ 21 jours) ; échantillon du 09/11/2025 au 07/09/2026, hors échantillon inchangé (07/09 → 07/11/2026) ; chaque modèle garde son intervalle ; grilles `objectif.multiple` × `croisement_ema.lente` (tendance-1h), `hauteur_range.min_pct` × `objectif.multiple` (cassure-matin), `entree.rsi_extreme.seuil` × `objectif.valeur` (repli-tendance). Les régimes restent calculés sur les bougies 5m. `catalogue.json` passe au format 2 : une construction par étape, et l'étape, le commit, les périodes et l'intervalle dans chaque entrée et chaque résultat ; une construction remplace seulement les résultats de sa propre étape. Synthèse : `backtests/synthese-7b.md`.
 
 Calcul en parallèle (processus `spawn`, un par cœur moins un, au plus 11), chaque processus lisant ses bougies dans `marche.db`.
 

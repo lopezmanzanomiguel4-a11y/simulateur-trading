@@ -206,6 +206,29 @@ def retour_dans_range(view: MarketView, p: dict) -> BrickResult:
     return BrickResult(candle.close < rng[0], {"range_haut": rng[0]})
 
 
+def au_dessus_ema(view: MarketView, p: dict) -> BrickResult:
+    """Vrai si la dernière clôture est au-dessus de l'EMA `n` des bougies de l'intervalle."""
+    candles = closed(view.candles, view.now)
+    value = market.ema(closes(candles), p["n"])
+    if value is None:
+        return BrickResult(None, {"ema": None})
+    return BrickResult(candles[-1].close > value, {"ema": value})
+
+
+def hauteur_range(view: MarketView, p: dict) -> BrickResult:
+    """Vrai si la hauteur du range d'ouverture ((haut − bas) / haut) atteint `min_pct` %.
+    Les paramètres du range (debut, minutes) viennent de la brique cassure_range."""
+    candle = last_closed(view)
+    if candle is None:
+        return BrickResult(None, {"hauteur_range_pct": None})
+    rng = opening_range(closed(view.candles_1m, view.now), session_start(candle.open_time), p["debut"], p["minutes"])
+    if rng is None:
+        return BrickResult(None, {"hauteur_range_pct": None})
+    high, low = rng
+    height = _q((high - low) / high * 100)
+    return BrickResult(height >= p["min_pct"], {"hauteur_range_pct": height})
+
+
 def duree_max(view: MarketView, p: dict, entered_at: datetime | None) -> BrickResult:
     """Vrai quand `bougies` bougies complètes de l'intervalle se sont écoulées depuis l'entrée."""
     candle = last_closed(view)

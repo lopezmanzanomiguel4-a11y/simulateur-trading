@@ -1,0 +1,18 @@
+{
+  "nom": "repli-tendance",
+  "paire": "BTCUSDT",
+  "intervalle": "15m",
+  "entree": [
+    {"brique": "au_dessus_ema", "n": 200},
+    {"brique": "rsi_extreme", "zone": "bas", "n": 14, "seuil": 30},
+    {"brique": "volatilite", "n": 14, "min_pct": "0.25", "max_pct": "2"}
+  ],
+  "sortie": [
+    {"brique": "rsi_extreme", "zone": "haut", "n": 14, "seuil": 70},
+    {"brique": "duree_max", "bougies": 32}
+  ],
+  "stop": {"type": "atr", "multiple": "2", "n": 14},
+  "objectif": {"type": "pct", "valeur": "1.5"},
+  "taille": {"pct_capital": "10"},
+  "heures_actives": {"debut": "02:00", "fin": "22:00"}
+}

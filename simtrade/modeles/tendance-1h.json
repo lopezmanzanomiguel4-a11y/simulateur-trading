@@ -1,0 +1,16 @@
+{
+  "nom": "tendance-1h",
+  "paire": "BTCUSDT",
+  "intervalle": "1h",
+  "entree": [
+    {"brique": "croisement_ema", "sens": "haussier", "rapide": 9, "lente": 21},
+    {"brique": "volatilite", "n": 14, "min_pct": "0.5", "max_pct": "3"}
+  ],
+  "sortie": [
+    {"brique": "croisement_ema", "sens": "baissier", "rapide": 9, "lente": 21}
+  ],
+  "stop": {"type": "atr", "multiple": "1.5", "n": 14},
+  "objectif": {"type": "atr", "multiple": "3", "n": 14},
+  "taille": {"pct_capital": "10"},
+  "heures_actives": {"debut": "01:00", "fin": "22:00"}
+}

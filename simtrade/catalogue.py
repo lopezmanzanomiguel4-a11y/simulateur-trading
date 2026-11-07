@@ -27,13 +27,14 @@ from typing import Any
 
 from simtrade import backtest, fmt, references, regimes, strategies
 from simtrade.backtest import BacktestConfig, EvalCache, Market
-from simtrade.market import Candle
+from simtrade.market import INTERVALS as MARKET_INTERVALS
+from simtrade.market import Candle, aggregate
 from simtrade.models import PAIRS
 from simtrade.stats import Stats
 
 UTC = timezone.utc
-VERSION = 1
-INTERVAL = "5m"
+VERSION = 2  # 2 : période, intervalle et commit portés par chaque entrée (étape 7b)
+INTERVAL = "5m"  # intervalle des modèles de l'étape 7 ; chaque modèle donne le sien (interval_of)
 MIN_TRADES = 30
 REGIME_MIN_TRADES = 20
 BEAT_SHARE = 0.90
@@ -51,6 +52,13 @@ GRID: dict[str, tuple[tuple[str, tuple[Any, ...]], tuple[str, tuple[Any, ...]]]]
     "tendance-ema": (("croisement_ema.rapide", (6, 9, 12)), ("croisement_ema.lente", (21, 30, 42))),
     "cassure-range": (("cassure_range.minutes", (15, 30, 60)), ("objectif.multiple", ("1", "1.5", "2.5"))),
 }
+# Étape 7b : modèles à faible fréquence (15m, 1h), grilles figées avant tout calcul (RAPPORT-ETAPE7B).
+GRID_7B: dict[str, tuple[tuple[str, tuple[Any, ...]], tuple[str, tuple[Any, ...]]]] = {
+    "tendance-1h": (("objectif.multiple", ("2", "3", "4")), ("croisement_ema.lente", (21, 30, 50))),
+    "cassure-matin": (("hauteur_range.min_pct", ("1", "1.5", "2")), ("objectif.multiple", ("1", "1.5", "2"))),
+    "repli-tendance": (("entree.rsi_extreme.seuil", ("25", "30", "35")), ("objectif.valeur", ("1", "1.5", "2"))),
+}
+GRIDS = {**GRID, **GRID_7B}
 
 
 @dataclass(frozen=True)
@@ -69,6 +77,12 @@ DEFAULT_PERIODS = Periods(
     datetime(2026, 5, 7, tzinfo=UTC), datetime(2026, 5, 9, tzinfo=UTC),
     datetime(2026, 9, 7, tzinfo=UTC), datetime(2026, 11, 7, tzinfo=UTC),
 )
+# 7b : 24 jours d'avance (fenêtre du live en 1h : 499 bougies ≈ 20,8 jours), hors échantillon inchangé.
+PERIODS_7B = Periods(
+    datetime(2025, 10, 16, tzinfo=UTC), datetime(2025, 11, 9, tzinfo=UTC),
+    datetime(2026, 9, 7, tzinfo=UTC), datetime(2026, 11, 7, tzinfo=UTC),
+)
+FAMILIES = {"7": (GRID, DEFAULT_PERIODS, "synthese.md"), "7b": (GRID_7B, PERIODS_7B, "synthese-7b.md")}
 
 Loader = Callable[[str, datetime, datetime], list[Candle]]
 
@@ -92,17 +106,26 @@ class StoreLoader:
 # --- Grille ---
 
 
+def interval_of(model: str) -> str:
+    return INTERVAL if model in GRID else strategies.model(model)["intervalle"]
+
+
+def family_of(models: Iterable[str]) -> str:
+    models = set(models)
+    return "7" if models <= set(GRID) else "7b"
+
+
 def strategy_for(model: str, pair: str, overrides: dict[str, Any]) -> strategies.Strategy:
-    raw = strategies.with_overrides(strategies.model(model), {"paire": pair, "intervalle": INTERVAL, **overrides})
+    raw = strategies.with_overrides(strategies.model(model), {"paire": pair, "intervalle": interval_of(model), **overrides})
     return strategies.validate(raw)
 
 
-def combos(model: str, grid=GRID) -> list[tuple[tuple[int, int], dict[str, Any]]]:
+def combos(model: str, grid=GRIDS) -> list[tuple[tuple[int, int], dict[str, Any]]]:
     (k1, v1), (k2, v2) = grid[model]
     return [((i, j), {k1: a, k2: b}) for i, a in enumerate(v1) for j, b in enumerate(v2)]
 
 
-def default_cell(model: str, grid=GRID) -> tuple[int, int]:
+def default_cell(model: str, grid=GRIDS) -> tuple[int, int]:
     """Position des valeurs par défaut du modèle dans la grille."""
     raw = strategies.model(model)
     defaults = strategies.validate({**raw, "paire": PAIRS[0]})
@@ -114,7 +137,10 @@ def default_cell(model: str, grid=GRID) -> tuple[int, int]:
 
 
 def _current(strategy: strategies.Strategy, key: str) -> Any:
-    group, param = key.split(".")
+    parts = key.split(".")
+    group, param = parts[-2], parts[-1]
+    if parts[0] == "sortie":
+        return next(b for b in strategy.sortie if b.name == group).params[param]
     if group == "stop":
         return strategy.stop.params[param]
     if group == "objectif":
@@ -123,7 +149,8 @@ def _current(strategy: strategies.Strategy, key: str) -> Any:
 
 
 def param_spec(model_raw: dict, key: str) -> strategies.Param:
-    group, param = key.split(".")
+    parts = key.split(".")
+    group, param = parts[-2], parts[-1]
     if group in ("stop", "objectif"):
         table = strategies.STOPS if group == "stop" else strategies.TARGETS
         return table[model_raw[group]["type"]][param]
@@ -189,7 +216,7 @@ def rectangle(cells: dict[tuple[int, int], Cell], choice: tuple[int, int], shape
     return best
 
 
-def bounds(model: str, rect: tuple[tuple[int, int], tuple[int, int]], grid=GRID) -> dict[str, dict[str, Any]]:
+def bounds(model: str, rect: tuple[tuple[int, int], tuple[int, int]], grid=GRIDS) -> dict[str, dict[str, Any]]:
     out = {}
     for (key, values), (lo, hi) in zip(grid[model], rect):
         chosen = sorted(values[lo : hi + 1], key=lambda v: Decimal(str(v)))
@@ -245,11 +272,11 @@ def admission(oos: Stats, open_close_pnl: Decimal, share: float) -> tuple[str, l
 _MARKET: dict[tuple, Market] = {}
 
 
-def _market(loader: Loader, pair: str, start: datetime, end: datetime) -> Market:
-    key = (loader, pair, start, end)
+def _market(loader: Loader, pair: str, start: datetime, end: datetime, interval: str = INTERVAL) -> Market:
+    key = (loader, pair, start, end, interval)
     if key not in _MARKET:
         _MARKET.clear()  # une seule paire en mémoire par processus
-        _MARKET[key] = Market(loader(pair, start, end), INTERVAL)
+        _MARKET[key] = Market(loader(pair, start, end), interval)
     return _MARKET[key]
 
 
@@ -260,7 +287,7 @@ def _compact(result: backtest.BacktestResult) -> list[tuple[datetime, Decimal]]:
 def in_sample_task(task: tuple) -> dict:
     loader, model, pair, cell, overrides, periods, config = task
     started = time.perf_counter()
-    market = _market(loader, pair, periods.data_start, periods.cut)  # rien après la coupure
+    market = _market(loader, pair, periods.data_start, periods.cut, interval_of(model))  # rien après la coupure
     result = backtest.run(strategy_for(model, pair, overrides), market, periods.is_start, periods.cut, config)
     return {"model": model, "pair": pair, "cell": cell, "overrides": overrides, "stats": result.stats,
             "trades": _compact(result), "seconds": time.perf_counter() - started}
@@ -269,7 +296,7 @@ def in_sample_task(task: tuple) -> dict:
 def out_of_sample_task(task: tuple) -> dict:
     loader, model, pair, overrides, periods, config, is_trades = task
     started = time.perf_counter()
-    market = _market(loader, pair, periods.data_start, periods.end)
+    market = _market(loader, pair, periods.data_start, periods.end, interval_of(model))
     strategy = strategy_for(model, pair, overrides)
     cache = EvalCache()
     result = backtest.run(strategy, market, periods.cut, periods.end, config, cache=cache)
@@ -277,9 +304,10 @@ def out_of_sample_task(task: tuple) -> dict:
                                BacktestConfig(**{**config.__dict__, "spread_pct": SENSITIVITY_SPREAD}))
     open_close = references.open_close(market, periods.cut, periods.end, config, strategy.taille_pct)
     nothing = references.do_nothing(config, periods.cut, periods.end)
-    in_sample_bars = [b for b in market.bars if b.close_time <= periods.cut]
+    bars_5m = market.bars if market.interval == "5m" else aggregate(market.ones, "5m")  # régimes toujours en 5m
+    in_sample_bars = [b for b in bars_5m if b.close_time <= periods.cut]
     thresholds = regimes.fit_thresholds(in_sample_bars)
-    timeline = regimes.Timeline(market.bars, thresholds)
+    timeline = regimes.Timeline(bars_5m, thresholds)
     return {
         "model": model, "pair": pair, "stats": result.stats, "sensitivity": sensitivity.stats,
         "open_close": open_close.stats, "nothing": nothing, "p": references.entry_rate(result),
@@ -294,7 +322,7 @@ def out_of_sample_task(task: tuple) -> dict:
 def draws_task(task: tuple) -> dict:
     loader, model, pair, overrides, periods, config, p, seeds, cache = task
     started = time.perf_counter()
-    market = _market(loader, pair, periods.data_start, periods.end)
+    market = _market(loader, pair, periods.data_start, periods.end, interval_of(model))
     strategy = strategy_for(model, pair, overrides)
     stats = references.random_draws(strategy, market, periods.cut, periods.end, config, p, seeds, cache)
     return {"model": model, "pair": pair, "seeds": list(seeds), "pnl": [s.pnl for s in stats],
@@ -463,6 +491,12 @@ def criteria_json() -> dict:
     }
 
 
+def _origin(b: Build, model: str) -> dict:
+    """Champs qui situent une entrée ou un résultat (format 2) : étape, commit, périodes, intervalle."""
+    return {"etape": family_of(m.model for m in b.couples), "commit": b.commit, "periodes": b.periods.json(),
+            "intervalle": interval_of(model)}
+
+
 def entry_json(c: Couple, reports_prefix: str = "backtests/") -> dict:
     strategy = strategy_for(c.model, c.pair, c.overrides or {})
     found = bounds(c.model, c.rect)  # type: ignore[arg-type]
@@ -472,7 +506,7 @@ def entry_json(c: Couple, reports_prefix: str = "backtests/") -> dict:
     return {
         "modele": c.model,
         "paire": c.pair,
-        "intervalle": INTERVAL,
+        "intervalle": interval_of(c.model),
         "parametres": c.overrides,
         "bornes": found,
         "definition": strategy.to_json(),
@@ -497,7 +531,7 @@ def catalogue_json(b: Build) -> dict:
     results = []
     for c in b.couples:
         results.append({
-            "modele": c.model, "paire": c.pair, "statut": c.status, "raisons": c.reasons,
+            "modele": c.model, "paire": c.pair, **_origin(b, c.model), "statut": c.status, "raisons": c.reasons,
             "parametres": c.overrides,
             "pnl_hors_echantillon": _d(c.oos["stats"].pnl) if c.oos else None,
             "trades_hors_echantillon": c.oos["stats"].trades if c.oos else None,
@@ -509,26 +543,74 @@ def catalogue_json(b: Build) -> dict:
             ],
             "rapport": "backtests/" + c.report_name,
         })
-    return {
-        "version": VERSION,
+    family = family_of(c.model for c in b.couples)
+    grid = FAMILIES[family][0]
+    construction = {
+        "etape": family,
         "cree_le": b.created_at.isoformat(),
         "commit": b.commit,
         "periodes": b.periods.json(),
-        "intervalle": INTERVAL,
+        "intervalles": {m: interval_of(m) for m in grid},
         "spread_pct": format(b.config.spread_pct, "f"),
         "frais_pct": format(b.config.fee_rate * 100, "f"),
         "capital": format(b.config.capital, "f"),
-        "grille": {m: {k: list(v) for k, v in g} for m, g in GRID.items()},
+        "grille": {m: {k: list(v) for k, v in g} for m, g in grid.items()},
         "criteres": criteria_json(),
         "tirages": {"n": len(b.seeds), "graines": [b.seeds[0], b.seeds[-1]] if b.seeds else []},
-        "entrees": [entry_json(c) for c in b.admitted],
+        "synthese": "backtests/" + FAMILIES[family][2],
+    }
+    return {
+        "version": VERSION,
+        "constructions": [construction],
+        "entrees": [{**entry_json(c), **_origin(b, c.model)} for c in b.admitted],
         "resultats": results,
     }
 
 
+def upgrade(data: dict) -> dict:
+    """Catalogue au format 1 (étape 7) → format 2 : les champs communs deviennent une construction et sont
+    recopiés dans chaque entrée et chaque résultat ; aucune autre valeur ne change."""
+    if data.get("version") == VERSION:
+        return data
+    if data.get("version") != 1:
+        raise ValueError("Catalogue illisible (version).")
+    interval = data.get("intervalle", INTERVAL)
+    common = {"etape": "7", "commit": data.get("commit"), "periodes": data.get("periodes"), "intervalle": interval}
+    construction = {"etape": "7", "cree_le": data.get("cree_le"), "commit": data.get("commit"),
+                    "periodes": data.get("periodes"), "intervalles": {m: interval for m in data.get("grille", {})},
+                    **{k: data[k] for k in ("spread_pct", "frais_pct", "capital", "grille", "criteres", "tirages")
+                       if k in data},
+                    "synthese": "backtests/synthese.md"}
+
+    def place(item: dict) -> dict:  # modèle et paire d'abord, puis l'origine, puis le reste tel quel
+        head = {k: item[k] for k in ("modele", "paire") if k in item}
+        return {**head, **common, **{k: v for k, v in item.items() if k not in head}}
+
+    return {"version": VERSION, "constructions": [construction],
+            "entrees": [place(e) for e in data.get("entrees", [])],
+            "resultats": [place(x) for x in data.get("resultats", [])]}
+
+
+def merge(previous: dict | None, new: dict) -> dict:
+    """Ajoute une construction au catalogue existant : les entrées et résultats des autres étapes restent tels
+    quels ; ceux de la même étape sont remplacés."""
+    if previous is None:
+        return new
+    old = upgrade(previous)
+    steps = {c["etape"] for c in new["constructions"]}
+
+    def keep(items: list) -> list:
+        return [x for x in items if x.get("etape") not in steps]
+
+    return {"version": VERSION,
+            "constructions": keep(old["constructions"]) + new["constructions"],
+            "entrees": keep(old["entrees"]) + new["entrees"],
+            "resultats": keep(old["resultats"]) + new["resultats"]}
+
+
 def validate_catalogue(data: dict) -> None:
     """Chaque entrée passe strategies.validate et ses bornes sont dans le schéma ; lève sinon."""
-    if data.get("version") != VERSION or not isinstance(data.get("entrees"), list):
+    if data.get("version") not in (1, VERSION) or not isinstance(data.get("entrees"), list):
         raise ValueError("Catalogue illisible (version ou entrées).")
     for e in data["entrees"]:
         strategies.validate(e["definition"])
@@ -584,7 +666,7 @@ def _settings(b: Build) -> str:
 def prudence(b: Build) -> str:
     tested = [c for c in b.couples if c.oos is not None]
     risk = 100 - BEAT_SHARE * 100
-    possible = len(GRID) * len(PAIRS)
+    possible = len(FAMILIES[family_of(c.model for c in b.couples)][0]) * len(PAIRS)
     if not tested:
         return (f"**Prudence statistique** : aucun couple n'a été testé hors échantillon, donc aucun faux positif "
                 f"possible ici. Si les {possible} couples l'avaient été, au seuil de {_n(risk, 0)} % face aux tirages "
@@ -593,12 +675,22 @@ def prudence(b: Build) -> str:
             f"hasard, au seuil de {_n(risk, 0)} %. Même sans aucun avantage réel, environ "
             f"{_n(len(tested) * (1 - BEAT_SHARE), 1)} couple(s) passeraient ce critère par hasard ({possible} tests "
             f"à ce seuil : environ un faux positif). Le critère reste à {_n(BEAT_SHARE * 100, 0)} % ; le percentile "
-            "exact de chaque couple est donné ci-dessus et dans son rapport.")
+            "exact de chaque couple est donné ci-dessus et dans son rapport." + explored(b))
+
+
+def explored(b: Build) -> str:
+    """Étape 7b : rappelle les combinaisons déjà explorées en échantillon à l'étape 7 (aucune n'est retestée)."""
+    if family_of(c.model for c in b.couples) == "7":
+        return ""
+    before = sum(len(combos(m)) for m in GRID) * len(PAIRS)
+    now = sum(len(combos(m)) for m in GRID_7B) * len(PAIRS)
+    return (f" En échantillon, {now} combinaisons ont été explorées ici, après {before} à l'étape 7 (autre "
+            "période, sans passage hors échantillon) : le risque de retenir un couple par chance en est accru.")
 
 
 def report_md(c: Couple, b: Build) -> str:
-    (k1, v1), (k2, v2) = GRID[c.model]
-    lines = [f"# {c.model} sur {c.pair} ({INTERVAL})", "",
+    (k1, v1), (k2, v2) = GRIDS[c.model]
+    lines = [f"# {c.model} sur {c.pair} ({interval_of(c.model)})", "",
              f"Statut : **{c.status}**" + (f" ({' ; '.join(c.reasons)})" if c.reasons else ""), "",
              f"Échantillon : {b.periods.is_start:%d/%m/%Y} → {b.periods.cut:%d/%m/%Y} ; hors échantillon : "
              f"{b.periods.cut:%d/%m/%Y} → {b.periods.end:%d/%m/%Y} (fin exclue). {_settings(b)[0].upper() + _settings(b)[1:]}.", "",
@@ -667,11 +759,15 @@ def report_md(c: Couple, b: Build) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _intervals(b: Build) -> str:
+    return " et ".join(sorted({interval_of(c.model) for c in b.couples}, key=lambda i: MARKET_INTERVALS[i]))
+
+
 def summary_md(b: Build) -> str:
     lines = ["# Catalogue : synthèse", "",
              f"Calcul terminé le {b.created_at:%d/%m/%Y à %H:%M} UTC (commit {b.commit or 'inconnu'}) : {durations(b)}.", "",
              f"Échantillon {b.periods.is_start:%d/%m/%Y} → {b.periods.cut:%d/%m/%Y}, hors échantillon "
-             f"{b.periods.cut:%d/%m/%Y} → {b.periods.end:%d/%m/%Y}, intervalle {INTERVAL}, {_settings(b)}. "
+             f"{b.periods.cut:%d/%m/%Y} → {b.periods.end:%d/%m/%Y}, intervalle {_intervals(b)}, {_settings(b)}. "
              "Critères figés avant le calcul (README, « Backtest et catalogue »).", "",
              "| Modèle | Paire | Statut | P&L hors éch. | Trades | Percentile tirages | Achat-clôture |",
              "|---|---|---|---|---|---|---|"]
@@ -686,12 +782,15 @@ def summary_md(b: Build) -> str:
 
 
 def write(b: Build, catalogue_path: Path, reports_dir: Path) -> dict:
-    data = catalogue_json(b)
+    """Écrit les rapports et fusionne la construction dans `catalogue_path` (les autres étapes sont gardées)."""
+    previous = json.loads(catalogue_path.read_text(encoding="utf-8")) if catalogue_path.exists() else None
+    data = merge(previous, catalogue_json(b))
     validate_catalogue(data)
     reports_dir.mkdir(parents=True, exist_ok=True)
     for c in b.couples:
         (reports_dir / c.report_name).write_text(report_md(c, b), encoding="utf-8", newline="\n")
-    (reports_dir / "synthese.md").write_text(summary_md(b), encoding="utf-8", newline="\n")
+    summary = FAMILIES[family_of(c.model for c in b.couples)][2]
+    (reports_dir / summary).write_text(summary_md(b), encoding="utf-8", newline="\n")
     catalogue_path.parent.mkdir(parents=True, exist_ok=True)
     catalogue_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8", newline="\n")
     return data

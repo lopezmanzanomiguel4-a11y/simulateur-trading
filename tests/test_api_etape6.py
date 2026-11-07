@@ -31,7 +31,8 @@ def client(tmp_path):
 
 def test_modeles_et_schema(client):
     body = client.get("/strategies").json()
-    assert [m["nom"] for m in body["modeles"]] == ["cassure-range", "retour-vwap", "tendance-ema"]
+    assert [m["nom"] for m in body["modeles"]] == ["cassure-matin", "cassure-range", "repli-tendance", "retour-vwap",
+                                                 "tendance-1h", "tendance-ema"]
     assert body["schema"]["objectif_minimum_pct"] == "0.3"
     assert body["schema"]["taille"]["pct_capital"] == {"type": "decimal", "defaut": "10", "min": "1", "max": "20"}
 

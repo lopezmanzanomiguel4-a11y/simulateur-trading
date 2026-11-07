@@ -25,7 +25,8 @@ def model(name, **changes):
 
 def test_les_trois_modeles_sont_valides_et_relus_a_l_identique():
     found = strategies.models()
-    assert sorted(found) == ["cassure-range", "retour-vwap", "tendance-ema"]
+    assert sorted(found) == ["cassure-matin", "cassure-range", "repli-tendance", "retour-vwap", "tendance-1h",
+                             "tendance-ema"]
     for raw in found.values():
         s = strategies.validate(raw)
         assert strategies.validate(s.to_json()) == s
@@ -68,7 +69,7 @@ BOUNDS = [
     ("tendance-ema", "croisement_ema.lente", "10", "9"),
     ("tendance-ema", "croisement_ema.lente", "200", "201"),
     ("cassure-range", "cassure_range.minutes", "15", "14"),
-    ("cassure-range", "cassure_range.minutes", "120", "121"),
+    ("cassure-range", "cassure_range.minutes", "480", "481"),
     ("cassure-range", "cassure_range.debut", "20:00", "20:01"),
     ("cassure-range", "stop.marge_pct", "0", "-0.01"),
     ("cassure-range", "stop.marge_pct", "1", "1.01"),
@@ -153,7 +154,7 @@ def test_schema_exporte_les_bornes():
     assert schema["objectif"]["pct"]["valeur"] == {"type": "decimal", "defaut": "1", "min": "0.3", "max": "10"}
     assert schema["briques"]["croisement_ema"]["lente"] == {"type": "entier", "defaut": 21, "min": 10, "max": 200}
     assert schema["briques"]["rsi_extreme"]["seuil"]["selon_zone"]["haut"]["min"] == "60"
-    assert schema["intervalle"]["choix"] == ["5m", "15m"]
+    assert schema["intervalle"]["choix"] == ["5m", "15m", "1h"]
 
 
 # --- Niveaux ---
