@@ -159,6 +159,19 @@ def build_parser() -> argparse.ArgumentParser:
     q = actions.add_parser("etat", help="lignes, période, trous et taille de marche.db")
     q.add_argument("--paires", nargs="+", default=list(PAIRS))
 
+    p = sub.add_parser("backtest", help="rejoue un modèle sur les bougies de marche.db (frais et spread compris)")
+    p.add_argument("modele", metavar="modèle", help="nom du modèle (voir : strategies)")
+    p.add_argument("surcharges", nargs="*", metavar="clé=valeur", help="ex. ecart_vwap.seuil_pct=0.8")
+    p.add_argument("--paire", default="BTCUSDT")
+    p.add_argument("--depuis", required=True, help="début (AAAA-MM-JJ, UTC) ; 2 jours avant sont lus pour les fenêtres")
+    p.add_argument("--jusqu-a", dest="jusqu_a", required=True, help="fin exclue (AAAA-MM-JJ, UTC)")
+    p.add_argument("--spread", default="0.02", help="spread simulé en %% (défaut 0.02)")
+
+    p = sub.add_parser("catalogue", help="catalogue des stratégies backtestées (affiche, ou construit)")
+    p.add_argument("action", nargs="?", choices=("afficher", "construire"), default="afficher")
+    p.add_argument("--processus", type=int, help="processus de calcul (défaut : cœurs - 1, au plus 11)")
+    p.add_argument("--sortie", help="dossier de sortie (catalogue.json et backtests/) ; défaut : le dépôt")
+
     sub.add_parser("info", help="chemin de la base et comptes enregistrés")
     sub.add_parser("api", help="lance l'API HTTP sur http://127.0.0.1:8000 (exécute les ordres en attente)")
     return parser
@@ -779,6 +792,130 @@ async def _download(store, args: argparse.Namespace) -> int:
     return 0
 
 
+def _print_stats(s) -> None:
+    rows = [
+        ("P&L net", fmt.usdt(s.pnl, sign=True) + f" ({_num(s.pnl_pct)} %)"),
+        ("Drawdown max", f"{_num(s.max_drawdown_pct)} %"),
+        ("Trades", str(s.trades)),
+        ("Taux de réussite", "-" if s.win_rate is None else f"{_num(s.win_rate, 1)} % ({s.wins}/{s.trades})"),
+        ("Gain moyen par trade", "-" if s.avg_pnl is None else fmt.usdt(s.avg_pnl, sign=True)),
+        ("Frais payés", fmt.usdt(s.fees)),
+        ("Sharpe (quotidien × √365)", "-" if s.sharpe is None else f"{s.sharpe:.2f}"),
+        ("Sessions (effectif)", str(s.sessions)),
+    ]
+    print(table(["Statistique", "Valeur"], rows, left=1))
+
+
+def cmd_backtest(service: TradingService, args: argparse.Namespace) -> int:
+    from collections import Counter
+    from datetime import timedelta
+    from decimal import Decimal
+
+    from simtrade import backtest
+    from simtrade.engine import parse_decimal
+    from simtrade.errors import InvalidInput
+    from simtrade.stats import parse_utc
+
+    start, end = parse_utc(args.depuis, "depuis"), parse_utc(args.jusqu_a, "jusqu-a")
+    if start >= end:
+        raise InvalidInput("La période est vide (--depuis doit précéder --jusqu-a).")
+    changes = {}
+    for item in args.surcharges:
+        key, sep, value = item.partition("=")
+        if not sep:
+            raise InvalidInput(f"Surcharge invalide : '{item}' (format clé=valeur).")
+        changes[key.strip()] = value.strip()
+    raw = strategies.with_overrides(strategies.model(args.modele), {"paire": args.paire, **changes})
+    strategy = strategies.validate(raw)
+    spread = parse_decimal(args.spread, "Spread")
+    if not Decimal(0) <= spread <= Decimal(5):
+        raise InvalidInput(f"Spread invalide : {args.spread} (de 0 à 5 %).")
+    candles = service.market_store().candles(strategy.paire, start - timedelta(days=2), end)
+    if not candles:
+        raise InvalidInput(
+            f"Aucune bougie {strategy.paire} dans marche.db pour cette période : python -m simtrade marche telecharger."
+        )
+    started = time.perf_counter()
+    r = backtest.run(strategy, candles, start, end, backtest.BacktestConfig(spread_pct=spread))
+    print(f"Backtest {strategy.nom} sur {strategy.paire} {strategy.intervalle}, {start:%Y-%m-%d %H:%M} → "
+          f"{end:%Y-%m-%d %H:%M} UTC, spread {fmt.num(spread)} %, frais {fmt.num(FEE_RATE * 100, 1)} % "
+          f"({time.perf_counter() - started:.1f} s)")
+    _print_stats(r.stats)
+    print(f"Clôtures évaluées : {r.decisions} ; entrées : {r.entries} ; sessions arrêtées (perte max) : {len(r.halts)}")
+    if r.ignored:
+        print("Signaux ignorés ou refusés : " + ", ".join(f"{k} {v}" for k, v in r.ignored.most_common()))
+    exits = Counter(t.exit_reason for t in r.trades)
+    if exits:
+        print("Sorties : " + ", ".join(f"{k} {v}" for k, v in sorted(exits.items())))
+    return 0
+
+
+def cmd_catalogue(service: TradingService, args: argparse.Namespace) -> int:
+    from simtrade.config import CATALOGUE_PATH
+
+    if args.action == "construire":
+        return _build_catalogue(service, args)
+    path = Path(args.sortie) / "catalogue.json" if args.sortie else CATALOGUE_PATH
+    if not path.exists():
+        print(f"Aucun catalogue ({path}) : python -m simtrade catalogue construire.")
+        return 0
+    data = json.loads(path.read_text(encoding="utf-8"))
+    p = data["periodes"]
+    print(f"Catalogue du {data['cree_le'][:16]} (commit {data.get('commit') or '?'}), hors échantillon "
+          f"{p['hors_echantillon'][0][:10]} → {p['hors_echantillon'][1][:10]}")
+    rows = []
+    for r in data["resultats"]:
+        trades = r["trades_hors_echantillon"]
+        pct = r["percentile_tirages"]
+        rows.append((r["modele"], r["paire"], r["statut"], r["pnl_hors_echantillon"] or "-",
+                     "-" if trades is None else str(trades), "-" if pct is None else f"{pct:.0f}"))
+    print(table(["Modèle", "Paire", "Statut", "P&L hors éch.", "Trades", "Percentile"], rows, left=3))
+    print(f"Stratégies admises : {len(data['entrees'])}" + (" (catalogue vide)" if not data["entrees"] else ""))
+    for e in data["entrees"]:
+        flag = ", fragile au spread" if e.get("fragile_spread") else ""
+        print(f"  {e['modele']} {e['paire']} : {e['parametres']}, régimes retenus : "
+              f"{', '.join(e['regimes_retenus']) or 'aucun'}{flag}")
+    return 0
+
+
+def _build_catalogue(service: TradingService, args: argparse.Namespace) -> int:
+    import subprocess
+    from datetime import timedelta
+
+    from simtrade import catalogue
+    from simtrade.config import CATALOGUE_PATH
+    from simtrade.errors import InvalidInput
+
+    store = service.market_store()
+    periods = catalogue.DEFAULT_PERIODS
+    for pair in PAIRS:
+        bounds = store.bounds(pair)
+        if bounds is None or bounds[0] > periods.data_start or bounds[1] < periods.end - timedelta(minutes=1):
+            raise InvalidInput(
+                f"Bougies {pair} incomplètes pour {periods.data_start:%Y-%m-%d} → {periods.end:%Y-%m-%d} : "
+                f"python -m simtrade marche telecharger --depuis {periods.data_start:%Y-%m-%d} "
+                f"--jusqu-a {periods.end:%Y-%m-%d}"
+            )
+    repo = Path(catalogue.__file__).resolve().parent.parent
+    try:
+        done = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=repo, capture_output=True, text=True, check=True)
+        commit = done.stdout.strip() or None
+    except (OSError, subprocess.CalledProcessError):
+        commit = None
+    out = Path(args.sortie) if args.sortie else None
+    cat_path = out / "catalogue.json" if out else CATALOGUE_PATH
+    reports = out / "backtests" if out else repo / "backtests"
+    processes = args.processus or catalogue.default_processes()
+    print(f"Construction du catalogue : {processes} processus, bougies {store.path}, sortie {cat_path} et {reports}",
+          flush=True)
+    b = catalogue.build(catalogue.StoreLoader(str(store.path)), processes=processes, commit=commit,
+                        progress=lambda m: print("  " + m, flush=True))
+    data = catalogue.write(b, cat_path, reports)
+    print(f"Terminé : {len(data['entrees'])} stratégie(s) admise(s) sur {len(data['resultats'])} ; "
+          + ", ".join(f"{k} {v / 60:.1f} min" for k, v in b.seconds.items()))
+    return 0
+
+
 def cmd_api() -> int:
     from simtrade.api import run  # import paresseux : FastAPI n'est chargé que pour l'API
 
@@ -812,4 +949,6 @@ COMMANDS = {
     "journal": cmd_journal,
     "stats": cmd_stats,
     "marche": cmd_marche,
+    "backtest": cmd_backtest,
+    "catalogue": cmd_catalogue,
 }

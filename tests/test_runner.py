@@ -328,3 +328,60 @@ def test_rejeu_identique_au_live(m):
 
     assert live == replay
     assert any(e for _, e, _ in replay) and not all(e for _, e, _ in replay)  # le scénario produit des signaux
+
+
+def test_backtest_identique_au_live(m):
+    """Étape 7 : backtest.run prend les mêmes décisions que le runner live, bougie par bougie, et passe les mêmes
+    ordres quand le live est coté comme le backtest (ouverture de la minute suivante, ± s/2)."""
+    from simtrade import backtest, trades
+    from simtrade.market import aggregate
+    from simtrade.models import MARKET
+
+    definition = {
+        **strategies.model("retour-vwap"),
+        "nom": "parite",
+        "entree": [
+            {"brique": "ecart_vwap", "cote": "sous", "seuil_pct": "0.1"},
+            {"brique": "rsi_extreme", "zone": "bas", "n": 14, "seuil": "45"},
+        ],
+        "sortie": [{"brique": "retour_vwap"}],
+        "stop": {"type": "pct", "valeur": "2"},
+        "objectif": {"type": "pct", "valeur": "5"},
+        "heures_actives": {"debut": "00:00", "fin": "23:00"},
+    }
+    strategy = strategies.validate(definition)
+    m.auto(definition=definition)
+    start = DAY.replace(hour=6)
+    prices = walk(401, seed=3)
+    ones = []
+    for i in range(400):
+        o, c = prices[i], prices[i + 1]
+        ones.append(candle(start + timedelta(minutes=i), c, "1m", open_=o, high=max(o, c) + D("0.03"),
+                           low=min(o, c) - D("0.03"), volume=str(1 + i % 5)))
+    five = aggregate(ones, "5m")
+    config = backtest.BacktestConfig(full_window=False)
+    h = config.half_spread
+
+    # Live : à chaque clôture, cotation = ouverture de la minute suivante ± s/2
+    account = m.service.account("robot")
+    live = []
+    for k, c in enumerate(five[:-1]):
+        m.load([c] + ones[5 * k : 5 * (k + 1)])
+        m.clock.now = c.close_time + timedelta(seconds=3)
+        m.healthy()
+        nxt = ones[5 * (k + 1)].open
+        m.quote(str(backtest._price(nxt * (1 - h))), str(backtest._price(nxt * (1 + h))))
+        m.tick()
+        state = m.runner.states[account.id]
+        live.append((state.candle, state.entry, state.exit))
+
+    result = backtest.run(strategy, ones, start, five[-2].close_time + timedelta(minutes=1), config)
+    assert result.evaluations == live
+
+    live_orders = m.service.history(compte="robot")[1]
+    key = lambda o: (o.side, o.kind, o.price, o.quantity, o.created_at.replace(second=0))  # live T+3 s, backtest T+1 s
+    assert [key(o) for o in result.orders] == [key(o) for o in live_orders]
+    assert len(live_orders) >= 2 and all(o.kind == MARKET for o in live_orders)  # entrées et sorties sur signal
+    live_trades = trades.trades_from_orders(live_orders, trades.links_from_signals(m.service.signals()))
+    assert [t.exit_reason for t in result.trades] == [t.exit_reason for t in live_trades]
+    assert [t.pnl for t in result.trades] == [t.pnl for t in live_trades]

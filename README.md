@@ -1,7 +1,7 @@
 # Simulateur de paper trading crypto
 
 Simulateur d'achat/vente de cryptomonnaies **avec de l'argent fictif** et des **prix réels**, en ligne de commande ou via une API HTTP locale.
-Étapes 1 à 6 d'un projet qui recevra plus tard une interface.
+Étapes 1 à 7 d'un projet qui recevra plus tard une interface.
 
 ## Ce que ça fait
 
@@ -19,6 +19,7 @@ Simulateur d'achat/vente de cryptomonnaies **avec de l'argent fictif** et des **
 - **Sessions intraday** pour les comptes automatiques : plus d'entrée après 23:00 UTC, clôture forcée de toutes les positions à 23:55 UTC (horaires paramétrables), avec rattrapage si l'API était arrêtée.
 - **Garde-fou de risque** sur chaque entrée d'un compte automatique : stop-loss obligatoire, taille max, perte max de session, entrées max, positions max, délai entre entrées. Les refus sont journalisés. Les sorties ne sont jamais bloquées.
 - **Stratégies intraday** décrites en JSON (sans code libre), combinant des **briques** pures : RSI en zone extrême, croisement d'EMA, écart au VWAP de session, cassure du range d'ouverture, filtre de volatilité. Une stratégie activée sur un compte automatique trade seule pendant que l'API tourne, toujours via le garde-fou, et chaque signal est journalisé.
+- **Backtest et catalogue** : bougies 1m sauvegardées (6 mois téléchargeables), journal et statistiques partagés par le live et le backtest, simulateur qui réutilise le code de décision du live avec des règles d'exécution prudentes, sélection des paramètres en échantillon, validation hors échantillon contre des références (dont 100 tirages au hasard), et un catalogue des stratégies admises (`simtrade/catalogue.json`, rapports dans `backtests/`).
 
 ## Installation (Windows / PowerShell)
 
@@ -92,6 +93,15 @@ python -m simtrade marche telecharger --paires BTCUSDT --depuis 2026-05-01 --jus
 python -m simtrade marche etat                          # lignes, période, trous et taille de marche.db
 python -m simtrade journal -c robot                     # signaux, refus, ordres et trades, dans l'ordre (--limite)
 python -m simtrade stats -c robot                       # P&L, drawdown, réussite, Sharpe... (--strategie, --depuis, --jusqu-a)
+```
+
+Backtest et catalogue (lisent `marche.db`, sans réseau) :
+
+```powershell
+python -m simtrade backtest retour-vwap --paire ETHUSDT --depuis 2026-06-01 --jusqu-a 2026-06-08
+python -m simtrade backtest retour-vwap ecart_vwap.seuil_pct=0.4 rsi_extreme.seuil=25 --depuis 2026-06-01 --jusqu-a 2026-06-08 --spread 0.05
+python -m simtrade catalogue construire                 # grille, sélection, hors échantillon, catalogue.json et backtests/ (--processus, --sortie)
+python -m simtrade catalogue                            # résultats du catalogue
 ```
 
 Comptes et sessions :
@@ -404,7 +414,38 @@ $$V_m = \text{solde}_m + \sum_i q_{i,m}\, c_{i,m} \left(1 - \frac{s}{2}\right)$$
 | Frais payés | somme des frais des ordres de la période |
 | Sharpe | $\dfrac{\bar r}{\sigma_r}\sqrt{365}$, taux sans risque nul |
 
-Pour le Sharpe, $r_d = \dfrac{V_d}{V_{d-1}} - 1$ est le rendement de chaque session (jour UTC) de la période, avec $V_d$ la valeur en fin de jour ($V_0$ avant le premier) : un jour sans trade ni position a un rendement nul et compte quand même. $\bar r$ est la moyenne et $\sigma_r$ l'écart type (dénominateur $N - 1$) des $N$ rendements. `null` sous 2 sessions ou si $\sigma_r = 0$. Le nombre de sessions (`sessions`) est toujours affiché. Le même module (`stats.py`) servira au backtest.
+Pour le Sharpe, $r_d = \dfrac{V_d}{V_{d-1}} - 1$ est le rendement de chaque session (jour UTC) de la période, avec $V_d$ la valeur en fin de jour ($V_0$ avant le premier) : un jour sans trade ni position a un rendement nul et compte quand même. $\bar r$ est la moyenne et $\sigma_r$ l'écart type (dénominateur $N - 1$) des $N$ rendements. `null` sous 2 sessions ou si $\sigma_r = 0$. Le nombre de sessions (`sessions`) est toujours affiché. Le même module (`stats.py`) sert au backtest.
+
+### Backtest et catalogue
+
+**Simulateur** (`backtest.py`, pur, CLI seulement : l'API ne fait que lire le catalogue). Il rejoue une stratégie sur les klines 1m de `marche.db` avec le **même code de décision que le live** : `strategies.evaluate` (sur la fenêtre du live : 499 bougies de l'intervalle et 1 439 bougies 1m clôturées), raisons d'ignorer (`entry_blockers`), stop et objectif (`levels`), garde-fou (`risk.check_entry`, état du compte reconstitué en mémoire), montants et frais (`engine.Portfolio`), sessions. Un test vérifie que le live et le simulateur prennent les mêmes décisions, bougie par bougie, et passent les mêmes ordres. Règles d'exécution, avec $o$, $h$, $l$ l'ouverture, le haut et le bas d'une minute et $s = 0{,}02\,\%$ le spread simulé :
+
+$$\text{ask} = o\left(1 + \frac{s}{2}\right) \qquad \text{bid} = o\left(1 - \frac{s}{2}\right)$$
+
+- décision à la clôture $T$ de chaque bougie ; exécution à l'ouverture de la minute qui commence en $T$ (achat à l'ask, vente sur signal au bid), ordre daté $T + 1$ s comme le live, qui décide quelques secondes après la clôture ;
+- stop touché si $l\left(1 - \frac{s}{2}\right) \le \text{stop}$, exécuté au niveau du stop ; objectif touché si $h\left(1 - \frac{s}{2}\right) \ge \text{objectif}$, exécuté au niveau de l'objectif ; les deux dans la même minute : **stop** ; ouverture déjà sous le stop (ou au-dessus de l'objectif) : exécution à l'ouverture, au bid, glissement enregistré ;
+- clôture forcée à 23:55 (ouverture de la minute, au bid), pas d'entrée à partir de 23:00 ; frais de 0,1 % par ordre ;
+- perte max de session vérifiée au plus bas de chaque minute en position, au bid estimé $l\left(1 - \frac{s}{2}\right)$, et après chaque vente ;
+- trou dans la fenêtre (minute absente, bougie incomplète, historique plus court que celui du live) : signal ignoré (`historique_partiel`) ; minute d'exécution absente : `pas_de_cotation_fraiche`.
+
+**Références**, sur les mêmes données et avec la même taille de position : ne rien faire ; acheter à 00:00 et vendre à la clôture de session, chaque jour, sans stop ; entrées au hasard. Pour ces dernières, chaque clôture éligible (sans position, heures actives, avant la dernière entrée, sans trou) donne une entrée avec la probabilité $p = \dfrac{\text{entrées de la stratégie}}{\text{clôtures éligibles}}$, puis le même calcul du stop et de l'objectif, les mêmes sorties et le même garde-fou ; 100 tirages, graines 1 à 100.
+
+**Régimes** (`regimes.py`, bougies 5m clôturées seulement), sur les 100 dernières bougies : ATR de Wilder sur 14 bougies en % de la clôture, et ratio d'efficacité sur 24 bougies :
+
+$$\text{ER}_T = \frac{|c_T - c_{T-24}|}{\sum_{t=T-23}^{T} |c_t - c_{t-1}|}$$
+
+`forte_volatilite` si l'ATR % atteint le quantile 80 % de l'échantillon (par paire) ; sinon `tendance` si l'ER atteint son quantile 70 % ; sinon `range`. Le régime de chaque trade est celui de son entrée.
+
+**Catalogue** (`catalogue construire`, règles figées avant tout calcul) :
+- données du 07/05 au 07/11/2026 ; échantillon du 09/05 au 07/09 (les deux premiers jours remplissent la fenêtre du live), hors échantillon du 07/09 au 07/11 ; intervalle 5m ; BTC, ETH, SOL ;
+- grille de 3 × 3 combinaisons par modèle (`ecart_vwap.seuil_pct` × `rsi_extreme.seuil`, `croisement_ema.rapide` × `croisement_ema.lente`, `cassure_range.minutes` × `objectif.multiple`) ; la phase en échantillon ne lit aucune bougie au-delà de la coupure ;
+- candidate : au moins 30 trades et un P&L > 0 en échantillon. Sélection par **voisinage** : score $S_{ij} = \frac{1}{|N_{ij}|}\sum_{(a,b) \in N_{ij}} \text{PnL}_{ab}$, où $N_{ij}$ contient la combinaison et ses voisines directes (haut, bas, gauche, droite) ; la candidate de meilleur score l'emporte (égalité : la plus proche des défauts) ; sans candidate, le couple modèle-paire est « rejeté en échantillon » ;
+- bornes publiées : le plus grand rectangle de la grille qui contient la combinaison choisie et dont toutes les combinaisons sont candidates ;
+- hors échantillon, lancé une seule fois : la stratégie, la même à $s = 0{,}05\,\%$ (sensibilité), et les références. Admission : P&L > 0, P&L supérieur à l'achat 00:00 / vente clôture, meilleur qu'au moins 90 % des tirages, au moins 30 trades (sinon « données insuffisantes »). Le percentile exact atteint face aux tirages est enregistré. Une stratégie admise dont le P&L est ≤ 0 à 0,05 % porte `"fragile_spread": true` ;
+- régimes retenus pour une stratégie : P&L par trade > 0 avec au moins 20 trades dans ce régime en échantillon ;
+- sorties : `simtrade/catalogue.json` (chaque entrée passe `strategies.validate`, bornes comprises dans le schéma) et un rapport Markdown par couple dans `backtests/`, plus `backtests/synthese.md`. Un catalogue vide est un résultat valide.
+
+Calcul en parallèle (processus `spawn`, un par cœur moins un, au plus 11), chaque processus lisant ses bougies dans `marche.db`.
 
 ## Tests
 
@@ -412,7 +453,7 @@ Pour le Sharpe, $r_d = \dfrac{V_d}{V_{d-1}} - 1$ est le rendement de chaque sess
 .venv\Scripts\python.exe -m pytest -q
 ```
 
-Les tests couvrent le moteur (frais, prix moyen, P&L réalisé/latent, performance, refus d'ordres, validation du capital), la persistance (redémarrage, reset, transactions), le parsing des messages Binance/Coinbase, la bascule entre sources, les commandes CLI, les routes de l'API, la reconnexion du flux, le refus des cotations périmées, la construction des bougies, le raccord avec l'historique (klines simulées par `httpx.MockTransport`), les indicateurs (valeurs calculées à la main), la qualité des données et les routes de marché. Pour l'étape 4 : déclenchement et glissement des ordres en attente (dont un stop sauté), exécution par le flux, paires liées, réservations, redémarrage, ordres posés ou annulés par une autre connexion, comptes en parallèle, entrées refusées après l'heure limite, clôture de fin de session, clôture reportée et rattrapage (horloge simulée), migration d'une base des étapes 1 à 3 et annulation complète en cas d'échec. Pour l'étape 5 : chaque règle du garde-fou à la limite exacte, « tout le capital sans stop » refusé et journalisé, entrée + stop atomique, stop qui part après la perte max, clôture de session jamais bloquée, annulation du dernier stop refusée, retard de boucle détecté, aucun accès SQLite depuis l'écouteur de cotations, migration v1 → v2. Pour l'étape 6 : chaque brique (valeurs calculées à la main), chaque borne de paramètre acceptée à la limite et refusée au-delà, objectif sous 0,30 % refusé, aucun signal sur une bougie non clôturée, un seul ordre par signal même après un redémarrage, panne entre l'achat et le commit (ni ordre ni signal, puis un seul ordre), aucun ordre si `qualite` est mauvaise (chaque raison), hors heures et après la dernière entrée, refus du garde-fou journalisé sans nouvel essai, sortie sur signal malgré la perte max, bougie non définitive, rejeu bougie par bougie identique au live, file de réception et chien de garde du flux, migration v2 → v3, routes et CLI des stratégies. Pour l'étape 7 : base des bougies (upsert idempotent, trous, chemin à côté de la base de trading), agrégation 1m → 5m/15m égale aux klines de l'intervalle, téléchargement (pagination, reprise, deux fois = mêmes lignes, écart comblé entre un bloc téléchargé et un bloc live, plage vide chez Binance demandée une seule fois, trous, 429 et 418 puis reprise, poids, refus pour espace disque), enregistrement live dans le thread SQLite et jamais depuis la boucle, trades et motifs de sortie, journal chronologique, statistiques calculées à la main (drawdown, Sharpe avec un jour à 0, taux de réussite, courbe marquée au bid), routes et CLI. Ils utilisent des données simulées ; une garde dans `tests/conftest.py` fait échouer tout test qui tenterait une résolution de nom ou une connexion hors de la machine.
+Les tests couvrent le moteur (frais, prix moyen, P&L réalisé/latent, performance, refus d'ordres, validation du capital), la persistance (redémarrage, reset, transactions), le parsing des messages Binance/Coinbase, la bascule entre sources, les commandes CLI, les routes de l'API, la reconnexion du flux, le refus des cotations périmées, la construction des bougies, le raccord avec l'historique (klines simulées par `httpx.MockTransport`), les indicateurs (valeurs calculées à la main), la qualité des données et les routes de marché. Pour l'étape 4 : déclenchement et glissement des ordres en attente (dont un stop sauté), exécution par le flux, paires liées, réservations, redémarrage, ordres posés ou annulés par une autre connexion, comptes en parallèle, entrées refusées après l'heure limite, clôture de fin de session, clôture reportée et rattrapage (horloge simulée), migration d'une base des étapes 1 à 3 et annulation complète en cas d'échec. Pour l'étape 5 : chaque règle du garde-fou à la limite exacte, « tout le capital sans stop » refusé et journalisé, entrée + stop atomique, stop qui part après la perte max, clôture de session jamais bloquée, annulation du dernier stop refusée, retard de boucle détecté, aucun accès SQLite depuis l'écouteur de cotations, migration v1 → v2. Pour l'étape 6 : chaque brique (valeurs calculées à la main), chaque borne de paramètre acceptée à la limite et refusée au-delà, objectif sous 0,30 % refusé, aucun signal sur une bougie non clôturée, un seul ordre par signal même après un redémarrage, panne entre l'achat et le commit (ni ordre ni signal, puis un seul ordre), aucun ordre si `qualite` est mauvaise (chaque raison), hors heures et après la dernière entrée, refus du garde-fou journalisé sans nouvel essai, sortie sur signal malgré la perte max, bougie non définitive, rejeu bougie par bougie identique au live, file de réception et chien de garde du flux, migration v2 → v3, routes et CLI des stratégies. Pour l'étape 7 : base des bougies (upsert idempotent, trous, chemin à côté de la base de trading), agrégation 1m → 5m/15m égale aux klines de l'intervalle, téléchargement (pagination, reprise, deux fois = mêmes lignes, écart comblé entre un bloc téléchargé et un bloc live, plage vide chez Binance demandée une seule fois, trous, 429 et 418 puis reprise, poids, refus pour espace disque), enregistrement live dans le thread SQLite et jamais depuis la boucle, trades et motifs de sortie, journal chronologique, statistiques calculées à la main (drawdown, Sharpe avec un jour à 0, taux de réussite, courbe marquée au bid), routes et CLI ; simulateur (futur empoisonné sans effet sur les décisions, stop et objectif dans la même minute, ouverture sous le stop, clôture de 23:55, pas d'entrée après 23:00, VWAP remis à zéro à minuit, frais et spread d'un aller-retour à la main, trou dans la fenêtre, perte max au plus bas de la minute), mêmes décisions et mêmes ordres que le live, références (tirages reproductibles par graine), régimes calculés sur le passé seulement, sélection par voisinage, rectangle des bornes (zone en L), échantillon qui ne lit jamais le hors échantillon, entrées de catalogue valides, catalogue vide valide, calcul en processus identique au calcul en série. Ils utilisent des données simulées ; une garde dans `tests/conftest.py` fait échouer tout test qui tenterait une résolution de nom ou une connexion hors de la machine.
 
 ## Architecture
 
@@ -440,6 +481,12 @@ simtrade/
   download.py  téléchargement des klines 1m : reprise, poids, attente sur 429/418, garde d'espace disque
   trades.py    trades reconstitués depuis les ordres, motifs de sortie, journal chronologique (pur)
   stats.py     courbe de valeur, P&L, drawdown, réussite, gain moyen, frais, Sharpe (pur)
+  backtest.py  simulateur : même code de décision que le live, règles d'exécution prudentes (pur)
+  references.py  références : ne rien faire, achat 00:00 / vente clôture, entrées au hasard
+  regimes.py   régimes de marché (volatilité, efficacité) sur les bougies passées (pur)
+  catalogue.py  grille, sélection, hors échantillon, admission, catalogue.json et rapports (processus spawn)
+  catalogue.json  catalogue des stratégies admises (lu par GET /catalogue)
+backtests/     rapports Markdown du catalogue
   hub.py       PriceHub (cotations + transactions, cache, bougies, raccord avec l'historique, reconnexion) et CachedFeed
   api.py       API FastAPI : create_app(), routes, websocket /ws/prix
   cli.py       ligne de commande
@@ -467,6 +514,9 @@ L'API ne fait qu'appeler `TradingService`, qui reçoit un `CachedFeed` à la pla
 - **CLI : une connexion websocket par commande** : chaque commande met 1 à 4 s à obtenir un prix (le temps d'établir la connexion). L'API n'a pas ce délai.
 - **Coinbase en secours est moins liquide en USDT** : le spread BTC-USDT y est nettement plus large que sur Binance (constaté : environ 3,5 pb contre moins de 0,01 pb), et le canal ticker ne se met à jour qu'à chaque transaction.
 - CLI : pas de reconnexion automatique si le flux continu `prix` est coupé en cours de route (l'API, elle, se reconnecte).
+- **Backtest : spread fixe** ($s = 0{,}02\,\%$, sensibilité à 0,05 %), carnet d'ordres ignoré, exécution complète au prix simulé. Le chemin du prix à l'intérieur d'une minute est inconnu : stop et objectif exécutés à leur niveau exact, stop retenu quand les deux sont touchés.
+- **Tests multiples** : 9 couples modèle-paire testés hors échantillon au seuil de 10 % face aux tirages au hasard peuvent donner environ un faux positif par hasard. Une stratégie admise n'est pas une stratégie gagnante garantie ; le percentile exact est publié.
+- **Un seul découpage échantillon / hors échantillon** (2 mois hors échantillon) : peu de trades par régime, résultats sensibles à la période.
 - **Bougies en mémoire rechargées au démarrage** : l'API recharge 1 journée en 1m et 500 bougies au-delà depuis Binance à chaque démarrage. Seules les 1m définitives sont sauvegardées (`marche.db`) ; une minute où l'API ne tournait pas manque, sauf à la télécharger ensuite (`marche telecharger`).
 - **Courbe de valeur au bid estimé** (clôture 1m × (1 − s/2), s = 0,02 %), pas au vrai bid du moment, qui n'est pas enregistré.
 - **Raccord au démarrage et après une coupure** : la bougie en cours manque les transactions exécutées avant que le websocket ne livre (de l'ordre de 1 % du nombre de transactions d'une minute BTC) ; elle est marquée `complete: false` jusqu'à son remplacement par la kline. Les indicateurs par défaut (bougies clôturées) l'utilisent entre sa clôture et son remplacement (2 à 7 s), et durablement si la réconciliation échoue.

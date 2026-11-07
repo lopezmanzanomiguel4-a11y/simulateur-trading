@@ -447,6 +447,11 @@ def _plan(strategy: Strategy, view: MarketView) -> Plan | None:
     return Plan(stop_pct, stop_level, target_pct, target_r)
 
 
+def plan(strategy: Strategy, view: MarketView) -> Plan | None:
+    """Stop et objectif qu'aurait une entrée à view.now, signal ou pas (entrées au hasard du backtest)."""
+    return _plan(strategy, view)
+
+
 def _combine(results: Sequence[tuple[str, BrickResult]], all_: bool) -> bool | None:
     oks = [r.ok for _, r in results]
     if all_:
