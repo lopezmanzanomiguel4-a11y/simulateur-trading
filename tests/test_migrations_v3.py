@@ -29,7 +29,9 @@ def make_v2(tmp_path, monkeypatch):
 def test_v2_vers_v3(tmp_path, monkeypatch):
     path = make_v2(tmp_path, monkeypatch)
     before = rows(path, "SELECT * FROM orders ORDER BY id"), rows(path, "SELECT * FROM accounts ORDER BY id")
-    s = Storage(path)
+    with monkeypatch.context() as m:  # étape 7c : la dernière version est 4, ce test vérifie le passage à 3
+        m.setattr(migrations, "VERSION", 3)
+        s = Storage(path)
     try:
         assert migrations.version(s.conn) == 3
         assert s.backup_path is not None and s.backup_path.name.startswith("v2.db.avant-v3-")

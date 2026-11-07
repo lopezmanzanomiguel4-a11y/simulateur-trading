@@ -14,7 +14,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
-from simtrade.models import LATE_SESSION_CLOSE, SESSION_CLOSE, STOP, TARGET, Order, Side
+from simtrade.models import LATE_SESSION_CLOSE, SESSION_CLOSE, STOP, TARGET, TRAILING, Order, Side
 
 EXIT_STOP = "stop"
 EXIT_TARGET = "objectif"
@@ -68,7 +68,7 @@ def links_from_signals(signals: Iterable[Any]) -> Links:
 
 
 def exit_reason(order: Order, links: Links) -> str:
-    if order.kind == STOP:
+    if order.kind in (STOP, TRAILING):
         return EXIT_STOP
     if order.kind == TARGET:
         return EXIT_TARGET

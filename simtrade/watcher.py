@@ -10,6 +10,11 @@ service, et quand une autre connexion (la CLI) a écrit dans la base.
 SessionScheduler vérifie chaque seconde si un compte auto doit être fermé (fin de session,
 ou rattrapage après un arrêt) ; si la cotation est périmée, il réessaie à la seconde suivante.
 Il enregistre aussi l'arrêt de session d'un compte auto qui a atteint sa perte max.
+
+Stop suiveur : le watcher retient le plus haut bid de l'heure UTC en cours pour chaque suiveur ; à la
+première cotation de l'heure suivante (bougie 1h close), il relève le stop avec ce plus haut. Le test
+de déclenchement se fait toujours AVANT, avec le niveau d'avant : même règle que le backtest sur
+barres 1h. Après un redémarrage, l'heure entamée est perdue (stop relevé plus tard : prudent).
 """
 
 from __future__ import annotations
@@ -17,10 +22,11 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable
-from datetime import datetime
+from datetime import datetime, timezone
+from decimal import Decimal
 
 from simtrade.hub import MAX_QUOTE_AGE
-from simtrade.models import PendingOrder, Quote
+from simtrade.models import TRAILING, PendingOrder, Quote
 from simtrade.orders import triggered
 from simtrade.service import SessionClose, TradeResult, TradingService
 
@@ -42,6 +48,7 @@ class OrderWatcher:
         self.index: dict[str, list[PendingOrder]] = {}
         self._version: int | None = None
         self._inflight: set[int] = set()  # ordres déjà dans la file du thread SQLite
+        self.trail_highs: dict[int, tuple[datetime, Decimal]] = {}  # suiveur -> (heure UTC, plus haut bid)
         service.listeners.append(self.load)
 
     def load(self) -> None:
@@ -66,6 +73,8 @@ class OrderWatcher:
         db = self.service.db
         for order in list(self.index.get(quote.pair, ())):
             if not triggered(order, quote):
+                if order.kind == TRAILING:
+                    self._track_high(order, quote, db)
                 continue
             if db is None:
                 result = self.service.execute_pending(order.id, quote)
@@ -76,7 +85,25 @@ class OrderWatcher:
                 db.submit(self._execute, order.id, quote)
         return done
 
+    def _track_high(self, order: PendingOrder, quote: Quote, db) -> None:
+        hour = quote.received_at.astimezone(timezone.utc).replace(minute=0, second=0, microsecond=0)
+        seen = self.trail_highs.get(order.id)
+        if seen is not None and seen[0] < hour:  # l'heure retenue est close : relèvement avec son plus haut
+            if db is None:
+                self.service.raise_trail(order.id, seen[1])
+            else:
+                db.submit(self._raise, order.id, seen[1])
+            seen = None
+        self.trail_highs[order.id] = (hour, quote.bid if seen is None else max(seen[1], quote.bid))
+
+    def _raise(self, pending_id: int, high: Decimal) -> None:
+        try:
+            self.service.raise_trail(pending_id, high)
+        except Exception:
+            log.exception("Relèvement du stop suiveur n°%s en erreur.", pending_id)
+
     def _execute(self, pending_id: int, quote: Quote) -> TradeResult | None:
+
         """Dans le thread SQLite : exécute l'ordre mis en file."""
         try:
             return self.service.execute_pending(pending_id, quote)

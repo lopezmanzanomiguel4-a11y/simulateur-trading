@@ -51,6 +51,17 @@ def parse_decimal(raw: object, label: str, error: type[SimTradeError] = InvalidI
     return value
 
 
+def parse_fee_rate(raw: object) -> Decimal:
+    """Taux de frais saisi en % par ordre : '0.1' (standard) ou '0.075' (BNB)."""
+    from simtrade.models import FEE_RATES
+
+    pct = parse_decimal(raw, "Frais")
+    rate = pct / 100
+    if rate not in FEE_RATES:
+        raise InvalidInput(f"Frais invalides : '{raw}' % (0.1 ou 0.075 avec BNB).")
+    return FEE_RATES[FEE_RATES.index(rate)]
+
+
 def validate_capital(raw: object = DEFAULT_CAPITAL) -> Decimal:
     value = parse_decimal(raw, "Capital", InvalidCapital)
     if value <= 0:

@@ -6,6 +6,11 @@ check_entry renvoie toutes les règles violées, ou une liste vide si l'entrée 
 
 Perte de session = P&L réalisé des ordres de la session + P&L latent des positions au bid.
 Valeur en début de session : E0 = E - perte de session (E = valeur actuelle au bid).
+
+Comptes swing (limites `max_week_loss_pct` et `max_exposure_pct` renseignées) : la perte de session
+est remplacée par la perte sur 7 x 24 h glissantes (réalisé des sorties des 7 derniers jours + latent,
+base = E - ce P&L), et l'exposition totale (somme des positions + achats réservés) est plafonnée.
+Les limites intraday laissent ces deux champs à None : leurs règles ne changent pas.
 """
 
 from __future__ import annotations
@@ -13,6 +18,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from decimal import Decimal
+
+from decimal import ROUND_DOWN
 
 from simtrade import fmt
 from simtrade.errors import InvalidInput, OrderRejected
@@ -30,6 +37,8 @@ MAX_LOSS = "perte_max_session"
 MAX_TRADES = "trades_max_session"
 MAX_POSITIONS = "positions_max"
 ENTRY_GAP = "delai_entrees"
+MAX_WEEK_LOSS = "perte_max_semaine"
+MAX_EXPOSURE = "exposition_max"
 STALE_PRICE = "prix_perime"
 
 
@@ -40,6 +49,12 @@ class RiskLimits:
     max_trades: int = 6  # entrées par session
     max_positions: int = 2  # paires exposées en même temps
     min_entry_gap: timedelta = timedelta(minutes=15)  # entre deux entrées sur la même paire
+    max_week_loss_pct: Decimal | None = None  # swing : perte max sur 7 jours glissants, en % de la valeur d'alors
+    max_exposure_pct: Decimal | None = None  # swing : somme des positions, en % de la valeur du compte
+
+    @property
+    def swing(self) -> bool:
+        return self.max_week_loss_pct is not None
 
 
 @dataclass(frozen=True)
@@ -51,10 +66,27 @@ class RiskState:
     last_entry: dict[str, datetime] = field(default_factory=dict)
     halted: bool = False  # perte max déjà atteinte dans la session
     stale: tuple[str, ...] = ()  # paires sans cotation fraîche
+    week_pnl: Decimal = Decimal(0)  # swing : réalisé des sorties sur 7 jours glissants + latent
 
     @property
     def start_equity(self) -> Decimal:
         return self.equity - self.session_pnl
+
+    @property
+    def week_start_equity(self) -> Decimal:
+        return self.equity - self.week_pnl
+
+
+# Défauts d'un compte swing : moins d'entrées, plus de positions, perte hebdo et exposition totale.
+SWING_LIMITS = RiskLimits(
+    max_position_pct=Decimal("20"),
+    max_session_loss_pct=Decimal("2"),  # non appliquée en swing (remplacée par la perte hebdo)
+    max_trades=3,  # entrées par jour UTC
+    max_positions=4,
+    min_entry_gap=timedelta(hours=1),
+    max_week_loss_pct=Decimal("4"),
+    max_exposure_pct=Decimal("60"),
+)
 
 
 @dataclass(frozen=True)
@@ -90,6 +122,12 @@ def loss_breached(state: RiskState, limits: RiskLimits) -> bool:
     return state.session_pnl <= -(limits.max_session_loss_pct / 100) * state.start_equity
 
 
+def week_loss_breached(state: RiskState, limits: RiskLimits) -> bool:
+    if limits.max_week_loss_pct is None:
+        return False
+    return state.week_pnl <= -(limits.max_week_loss_pct / 100) * state.week_start_equity
+
+
 def check_entry(request: EntryRequest, state: RiskState, limits: RiskLimits) -> list[Refusal]:
     refusals: list[Refusal] = []
     pair = request.pair
@@ -112,7 +150,17 @@ def check_entry(request: EntryRequest, state: RiskState, limits: RiskLimits) -> 
         )
     if state.stale:
         refusals.append(Refusal(STALE_PRICE, f"pas de cotation fraîche pour {', '.join(state.stale)}"))
-    if state.halted or loss_breached(state, limits):
+    if limits.swing:
+        if week_loss_breached(state, limits):
+            refusals.append(
+                Refusal(
+                    MAX_WEEK_LOSS,
+                    f"perte max sur 7 jours glissants atteinte ({fmt.usdt(state.week_pnl, sign=True)}, "
+                    f"limite {fmt.num(limits.max_week_loss_pct)} % de {fmt.usdt(state.week_start_equity)}) : "
+                    "plus d'entrée tant qu'elle n'est pas sortie de la fenêtre",
+                )
+            )
+    elif state.halted or loss_breached(state, limits):
         refusals.append(
             Refusal(
                 MAX_LOSS,
@@ -145,7 +193,40 @@ def check_entry(request: EntryRequest, state: RiskState, limits: RiskLimits) -> 
                 f"de la valeur du compte = {fmt.usdt(cap)}",
             )
         )
+    if limits.max_exposure_pct is not None:
+        total = sum(state.exposure.values(), Decimal(0)) + request.amount
+        cap_total = limits.max_exposure_pct / 100 * state.equity
+        if total > cap_total:
+            refusals.append(
+                Refusal(
+                    MAX_EXPOSURE,
+                    f"exposition totale de {fmt.usdt(total)} après l'entrée, max {fmt.num(limits.max_exposure_pct)} % "
+                    f"de la valeur du compte = {fmt.usdt(cap_total)}",
+                )
+            )
     return refusals
+
+
+CENT = Decimal("0.01")
+
+
+def risk_size(
+    equity: Decimal, cash: Decimal, ask: Decimal, stop: Decimal, risk_pct: Decimal,
+    max_position_pct: Decimal, fee_rate: Decimal,
+) -> Decimal:
+    """Montant d'achat (USDT, frais inclus) qui risque `risk_pct` % de la valeur du compte jusqu'au stop.
+
+    q = risque % x valeur / (entrée - stop), entrée = ask ; montant = q x ask x (1 + frais),
+    plafonné par la taille max du garde-fou (montant frais inclus, comme l'exposition qu'il vérifie)
+    puis par le cash libre ; arrondi au centime inférieur.
+    """
+    if ask - stop <= 0:
+        raise OrderRejected(f"Taille au risque impossible : le stop ({fmt.price(stop)}) doit être sous l'entrée "
+                            f"({fmt.price(ask)}).")
+    quantity = risk_pct / 100 * equity / (ask - stop)
+    amount = quantity * ask * (1 + fee_rate)
+    amount = min(amount, max_position_pct / 100 * equity, cash)
+    return max(amount, Decimal(0)).quantize(CENT, rounding=ROUND_DOWN)
 
 
 def _duration(delta: timedelta) -> str:
@@ -158,7 +239,8 @@ def _duration(delta: timedelta) -> str:
 # --- Lecture et validation des limites (saisies en texte) ---
 
 KEYS = {"taille": "max_position_pct", "perte": "max_session_loss_pct", "trades": "max_trades",
-        "positions": "max_positions", "delai": "min_entry_gap"}
+        "positions": "max_positions", "delai": "min_entry_gap", "semaine": "max_week_loss_pct",
+        "exposition": "max_exposure_pct"}
 
 
 def parse_gap(raw: object) -> timedelta:
@@ -208,6 +290,11 @@ def update_limits(limits: RiskLimits, changes: dict[str, object]) -> RiskLimits:
             values["max_trades"] = _count(raw, "Entrées max par session")
         elif key == "positions":
             values["max_positions"] = _count(raw, "Positions max")
+        elif key in ("semaine", "exposition"):
+            if not limits.swing:
+                raise InvalidInput(f"Limite '{key}' réservée aux comptes swing.")
+            label = "Perte max sur 7 jours" if key == "semaine" else "Exposition totale max"
+            values[KEYS[key]] = _pct(raw, label)
         else:
             values["min_entry_gap"] = parse_gap(raw)
     return RiskLimits(**{**limits.__dict__, **values})

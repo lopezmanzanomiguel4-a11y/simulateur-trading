@@ -92,6 +92,7 @@ class EntryBody(BaseModel):
     montant: str
     stop: str
     objectif: str | None = None
+    suiveur: bool = False  # stop suiveur : distance figée = bid à l'achat - stop
 
 
 class MoveStopBody(BaseModel):
@@ -132,6 +133,8 @@ class AccountBody(BaseModel):
     nom: str
     capital: str = str(DEFAULT_CAPITAL)
     mode: str = MANUAL
+    horizon: str = "intraday"
+    frais: str = "0.1"  # % par ordre : 0.1 ou 0.075 (BNB)
 
 
 class SessionBody(BaseModel):
@@ -180,6 +183,8 @@ def account_json(account: Account) -> dict:
         "solde": dec(account.cash),
         "cree_le": iso(account.created_at),
         "archive_le": opt_iso(account.archived_at),
+        "horizon": account.horizon,
+        "frais_pct": dec(account.fee_rate * 100),
     }
 
 
@@ -222,6 +227,8 @@ def pending_json(order: PendingOrder) -> dict:
         "cree_le": iso(order.created_at),
         "clos_le": opt_iso(order.closed_at),
         "ordre_execute_id": order.order_id,
+        **({"distance_suiveur": dec(order.trail_distance), "plus_haut_suiveur": opt(order.trail_high)}
+           if order.trail_distance is not None else {}),
     }
 
 
@@ -233,6 +240,8 @@ def limits_json(limits: RiskLimits) -> dict:
         "positions_max": limits.max_positions,
         "delai_entrees_s": int(limits.min_entry_gap.total_seconds()),
         "stop_obligatoire": True,
+        **({"perte_max_semaine_pct": opt(limits.max_week_loss_pct), "exposition_max_pct": opt(limits.max_exposure_pct)}
+           if limits.swing else {}),
     }
 
 
@@ -520,7 +529,9 @@ def create_app(service: ServiceFactory | None = None, hub: PriceHub | None = Non
     @app.post("/ordres/entree")
     async def entree(body: EntryBody, request: Request, compte: str | None = None) -> dict:
         svc = svc_of(request)
-        result = await svc.buy(body.paire, body.montant, compte=compte, stop=body.stop, target=body.objectif)
+        result = await svc.buy(
+            body.paire, body.montant, compte=compte, stop=body.stop, target=body.objectif, trailing=body.suiveur
+        )
         protection = await svc.run(svc.storage.protection_orders, result.order.account_id, result.order.pair)
         return {**trade_json(result), "protection": [pending_json(o) for o in protection]}
 
@@ -583,7 +594,8 @@ def create_app(service: ServiceFactory | None = None, hub: PriceHub | None = Non
     @app.post("/comptes")
     async def creer_compte(body: AccountBody, request: Request) -> dict:
         svc = svc_of(request)
-        return {"compte": account_json(await svc.run(svc.create_account, body.nom, body.capital, body.mode))}
+        account = await svc.run(svc.create_account, body.nom, body.capital, body.mode, body.horizon, body.frais)
+        return {"compte": account_json(account)}
 
     @app.post("/comptes/{nom}/choisir")
     async def choisir_compte(nom: str, request: Request) -> dict:

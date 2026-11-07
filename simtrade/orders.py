@@ -4,6 +4,8 @@ Conventions (positions longues uniquement, pas de stop d'achat) :
 - achat limite : déclenché quand ask <= limite, exécuté à l'ask ;
 - vente limite et objectif : déclenchés quand bid >= prix, exécutés au bid ;
 - stop : déclenché quand bid <= stop, exécuté au bid disponible, même s'il a sauté sous le stop ;
+- stop suiveur : déclenché et exécuté comme un stop ; son niveau = plus haut bid retenu - distance
+  (figée à la pose), relevé seulement après le test de déclenchement, et jamais abaissé ;
 - glissement (USDT) = écart défavorable entre le prix de déclenchement et le prix d'exécution, x quantité :
   positif = coût, négatif = amélioration.
 """
@@ -15,9 +17,10 @@ from decimal import Decimal
 from simtrade import fmt
 from simtrade.engine import QTY_STEP, _q, parse_decimal
 from simtrade.errors import OrderRejected
-from simtrade.models import LIMIT, STOP, TARGET, PendingOrder, Quote, Side, base_asset
+from simtrade.models import LIMIT, STOP, TARGET, TRAILING, PendingOrder, Quote, Side, base_asset
 
 KINDS: tuple[str, ...] = (LIMIT, STOP, TARGET)
+STOP_KINDS: tuple[str, ...] = (STOP, TRAILING)  # sorties déclenchées par une baisse du bid
 
 
 def parse_price(raw: object, label: str = "Prix") -> Decimal:
@@ -30,9 +33,26 @@ def parse_price(raw: object, label: str = "Prix") -> Decimal:
 def triggered(order: PendingOrder, quote: Quote) -> bool:
     if order.side is Side.BUY:
         return quote.ask <= order.trigger_price
-    if order.kind == STOP:
+    if order.kind in STOP_KINDS:
         return quote.bid <= order.trigger_price
     return quote.bid >= order.trigger_price
+
+
+def trail_level(high: Decimal, distance: Decimal) -> Decimal:
+    return high - distance
+
+
+def raise_trail(order: PendingOrder, high: Decimal) -> tuple[Decimal, Decimal] | None:
+    """Nouveau (plus haut retenu, niveau) d'un stop suiveur pour un nouveau plus haut `high` (en bid),
+    ou None s'il ne monte pas. Le niveau ne descend jamais."""
+    if order.kind != TRAILING or order.trail_distance is None or order.trail_high is None:
+        return None
+    new_high = max(order.trail_high, high)
+    level = max(trail_level(new_high, order.trail_distance), order.trigger_price)
+    if level <= order.trigger_price:
+        return None
+    return new_high, level
+
 
 
 def slippage(side: Side, trigger_price: Decimal, fill_price: Decimal, quantity: Decimal) -> Decimal:

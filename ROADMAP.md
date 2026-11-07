@@ -4,6 +4,8 @@
 
 Paper trading crypto **intraday** (argent fictif, prix réels Binance) piloté par **une équipe d'agents IA qui débat**. 100 % gratuit, partageable : les agents ne dépendent d'aucun compte Claude ni d'aucune API payante.
 
+À côté de l'intraday, un mode **swing** (positions tenues plusieurs jours, sur comptes séparés) laisse aux mouvements le temps de dépasser les frais.
+
 Principe : les agents **n'inventent pas** de stratégies et **ne passent pas** les ordres eux-mêmes. Ils lisent le marché, débattent du **régime** du moment et **choisissent une stratégie dans un catalogue déjà backtesté**, avec des paramètres dans des bornes fixées. Le code l'exécute, le garde-fou a le dernier mot.
 
 Architecture :
@@ -39,10 +41,14 @@ Architecture :
 | 6 | Briques et stratégies intraday (exécution rapide) | ✅ |
 | 7 | Journal, statistiques et backtest → catalogue | ✅ |
 | 7b | Stratégies à faible fréquence → catalogue | ✅ |
+| 7c | Simulateur swing (positions multi-jours, stop suiveur, taille au risque, données longues) | ⬜ |
+| 7d | Modèles swing et validation glissante → catalogue | ⬜ |
+| 7e | Test en avant du catalogue swing (2–3 mois en papier) | ⬜ |
 | 8 | Équipe d'agents IA (choix du régime et de la stratégie) | ⬜ |
 | 9 | Interface | ⬜ |
 | 10 | Comparaison : agents vs références | ⬜ |
 | 11 | Logiciel installable | ⬜ |
+| 12 | Avis des agents sur le marché et des placements (sans trader) | ⬜ |
 
 ### 4. Ordres avancés, sessions intraday et comptes multiples
 

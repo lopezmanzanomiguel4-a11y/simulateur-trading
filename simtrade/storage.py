@@ -21,12 +21,18 @@ from pathlib import Path
 from simtrade import migrations
 from simtrade.engine import DEFAULT_CAPITAL, Portfolio, validate_capital
 from simtrade.errors import InvalidInput
-from simtrade.risk import RiskLimits
+from simtrade.risk import SWING_LIMITS, RiskLimits
 from simtrade.models import (
     CANCELLED,
     MANUAL,
     MODES,
     PENDING,
+    AUTO,
+    FEE_RATES,
+    FEE_STANDARD,
+    HORIZONS,
+    INTRADAY,
+    SWING,
     Account,
     Order,
     PendingOrder,
@@ -161,7 +167,8 @@ class Storage:
         return account
 
     def create_account(
-        self, name: object, capital: object = DEFAULT_CAPITAL, mode: str = MANUAL, now: datetime | None = None
+        self, name: object, capital: object = DEFAULT_CAPITAL, mode: str = MANUAL, now: datetime | None = None,
+        horizon: str = INTRADAY, fee_rate: Decimal = FEE_STANDARD,
     ) -> Account:
         clean = str(name).strip().lower()
         if not NAME_RE.fullmatch(clean) or clean.isdigit():
@@ -170,6 +177,12 @@ class Storage:
             )
         if mode not in MODES:
             raise InvalidInput(f"Mode de compte invalide : '{mode}' ({' ou '.join(MODES)}).")
+        if horizon not in HORIZONS:
+            raise InvalidInput(f"Horizon de compte invalide : '{horizon}' ({' ou '.join(HORIZONS)}).")
+        if horizon == SWING and mode != AUTO:
+            raise InvalidInput("Un compte swing est forcément automatique (mode auto).")
+        if fee_rate not in FEE_RATES:
+            raise InvalidInput(f"Taux de frais invalide : {fee_rate} (0,1 % ou 0,075 % avec BNB).")
         amount = validate_capital(capital)
         with self.transaction():
             self.active_account()  # le compte principal existe avant les autres
@@ -178,7 +191,8 @@ class Storage:
             ).fetchone()
             if taken:
                 raise InvalidInput(f"Un compte ouvert s'appelle déjà '{clean}'.")
-            return self._open_account(amount, now or utcnow(), clean, mode, current=False)
+            return self._open_account(amount, now or utcnow(), clean, mode, current=False, horizon=horizon,
+                                      fee_rate=fee_rate)
 
     def select_account(self, ref: object) -> Account:
         with self.transaction():
@@ -205,10 +219,12 @@ class Storage:
         with self.transaction():
             old = self.account(account)
             self._archive(old.id, now, "reset")
-            new = self._open_account(amount, now, old.name, old.mode, current=old.current)
+            new = self._open_account(amount, now, old.name, old.mode, current=old.current, horizon=old.horizon,
+                                     fee_rate=old.fee_rate)
             self.conn.execute(
                 "INSERT INTO risk_limits SELECT ?, max_position_pct, max_session_loss_pct, max_trades, "
-                "max_positions, min_entry_gap_s FROM risk_limits WHERE account_id = ?",
+                "max_positions, min_entry_gap_s, max_week_loss_pct, max_exposure_pct FROM risk_limits "
+                "WHERE account_id = ?",
                 (new.id, old.id),
             )
             return new
@@ -221,13 +237,15 @@ class Storage:
         )
 
     def _open_account(
-        self, capital: Decimal, now: datetime, name: str = DEFAULT_NAME, mode: str = MANUAL, current: bool = True
+        self, capital: Decimal, now: datetime, name: str = DEFAULT_NAME, mode: str = MANUAL, current: bool = True,
+        horizon: str = INTRADAY, fee_rate: Decimal = FEE_STANDARD,
     ) -> Account:
         cur = self.conn.execute(
-            "INSERT INTO accounts (initial_capital, cash, created_at, active, name, mode) VALUES (?, ?, ?, ?, ?, ?)",
-            (str(capital), str(capital), now.isoformat(), 1 if current else 0, name, mode),
+            "INSERT INTO accounts (initial_capital, cash, created_at, active, name, mode, horizon, fee_rate) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (str(capital), str(capital), now.isoformat(), 1 if current else 0, name, mode, horizon, str(fee_rate)),
         )
-        return Account(cur.lastrowid, capital, capital, now, name, mode, None, current)
+        return Account(cur.lastrowid, capital, capital, now, name, mode, None, current, horizon, fee_rate)
 
     # --- Portefeuille ---
 
@@ -253,7 +271,8 @@ class Storage:
             group = excluded.group_id if excluded else None
             pending = [p for p in pending if p.id != exclude_pending and (group is None or p.group_id != group)]
         reserved_cash, reserved_qty = _reservations(pending, positions)
-        return Portfolio(account, positions, realized, fees, reserved_cash=reserved_cash, reserved_qty=reserved_qty)
+        return Portfolio(account, positions, realized, fees, fee_rate=account.fee_rate, reserved_cash=reserved_cash,
+                         reserved_qty=reserved_qty)
 
     def save_trade(self, portfolio: Portfolio, order: Order) -> Order:
         """Enregistre l'ordre et l'état du portefeuille qui en résulte, de façon atomique."""
@@ -312,8 +331,8 @@ class Storage:
             for order in orders:
                 cur = self.conn.execute(
                     "INSERT INTO pending_orders (account_id, pair, kind, side, trigger_price, amount, quantity, "
-                    "status, created_at, protection, stop_price, target_price) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "status, created_at, protection, stop_price, target_price, trail_distance, trail_high) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         order.account_id,
                         order.pair,
@@ -327,6 +346,8 @@ class Storage:
                         int(order.protection),
                         _opt_str(order.stop_price),
                         _opt_str(order.target_price),
+                        _opt_str(order.trail_distance),
+                        _opt_str(order.trail_high),
                     ),
                 )
                 saved.append(replace(order, id=cur.lastrowid, status=PENDING))
@@ -378,6 +399,13 @@ class Storage:
             "UPDATE pending_orders SET trigger_price = ? WHERE id = ? AND status = ?", (str(price), pending_id, PENDING)
         )
 
+    def set_trail(self, pending_id: int, high: Decimal, trigger: Decimal) -> None:
+        """Relève un stop suiveur : nouveau plus haut retenu et nouveau niveau (le niveau ne descend jamais)."""
+        self.conn.execute(
+            "UPDATE pending_orders SET trail_high = ?, trigger_price = ? WHERE id = ? AND status = ?",
+            (str(high), str(trigger), pending_id, PENDING),
+        )
+
     def cancel_account_pending(self, account_id: int, reason: str, now: datetime) -> int:
         cur = self.conn.execute(
             "UPDATE pending_orders SET status = ?, reason = ?, closed_at = ? WHERE account_id = ? AND status = ?",
@@ -427,21 +455,27 @@ class Storage:
         """Limites du compte ; les valeurs par défaut de risk.py s'il n'en a pas."""
         row = self.conn.execute("SELECT * FROM risk_limits WHERE account_id = ?", (account_id,)).fetchone()
         if row is None:
-            return RiskLimits()
+            horizon = self.conn.execute("SELECT horizon FROM accounts WHERE id = ?", (account_id,)).fetchone()
+            return SWING_LIMITS if horizon is not None and horizon[0] == SWING else RiskLimits()
         return RiskLimits(
             Decimal(row["max_position_pct"]),
             Decimal(row["max_session_loss_pct"]),
             row["max_trades"],
             row["max_positions"],
             timedelta(seconds=row["min_entry_gap_s"]),
+            _opt_dec(row["max_week_loss_pct"]),
+            _opt_dec(row["max_exposure_pct"]),
         )
 
     def set_risk_limits(self, account_id: int, limits: RiskLimits) -> None:
         self.conn.execute(
-            "INSERT INTO risk_limits VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(account_id) DO UPDATE SET "
+            "INSERT INTO risk_limits (account_id, max_position_pct, max_session_loss_pct, max_trades, max_positions, "
+            "min_entry_gap_s, max_week_loss_pct, max_exposure_pct) VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(account_id) DO UPDATE SET "
             "max_position_pct = excluded.max_position_pct, max_session_loss_pct = excluded.max_session_loss_pct, "
             "max_trades = excluded.max_trades, max_positions = excluded.max_positions, "
-            "min_entry_gap_s = excluded.min_entry_gap_s",
+            "min_entry_gap_s = excluded.min_entry_gap_s, max_week_loss_pct = excluded.max_week_loss_pct, "
+            "max_exposure_pct = excluded.max_exposure_pct",
             (
                 account_id,
                 str(limits.max_position_pct),
@@ -449,6 +483,8 @@ class Storage:
                 limits.max_trades,
                 limits.max_positions,
                 int(limits.min_entry_gap.total_seconds()),
+                _opt_str(limits.max_week_loss_pct),
+                _opt_str(limits.max_exposure_pct),
             ),
         )
 
@@ -702,6 +738,8 @@ def _account(row: sqlite3.Row) -> Account:
         mode=row["mode"],
         archived_at=_opt_dt(row["archived_at"]),
         current=bool(row["active"]),
+        horizon=row["horizon"],
+        fee_rate=Decimal(row["fee_rate"]),
     )
 
 
@@ -745,7 +783,10 @@ def _pending(row: sqlite3.Row) -> PendingOrder:
         protection=bool(row["protection"]),
         stop_price=_opt_dec(row["stop_price"]),
         target_price=_opt_dec(row["target_price"]),
+        trail_distance=_opt_dec(row["trail_distance"]),
+        trail_high=_opt_dec(row["trail_high"]),
     )
+
 
 
 def _activation(row: sqlite3.Row) -> ActivationRecord:

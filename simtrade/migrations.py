@@ -4,6 +4,7 @@ v0 : étapes 1 à 3 (un seul compte actif, ordres au marché).
 v1 : étape 4 (comptes nommés manuel/auto en parallèle, ordres en attente, sessions, réglages).
 v2 : étape 5 (garde-fou : stops de protection, limites par compte, journal des refus, arrêts de session).
 v3 : étape 6 (stratégies activées sur les comptes auto, journal des signaux).
+v4 : étape 7c (horizon intraday/swing et taux de frais par compte, limites swing, stop suiveur).
 
 Une base existante est d'abord sauvegardée (sqlite3 backup, cohérent même base ouverte), puis
 migrée jusqu'à la dernière version dans UNE transaction : en cas d'échec, ROLLBACK complet et
@@ -20,7 +21,7 @@ from simtrade.errors import SimTradeError
 from simtrade.models import utcnow
 from simtrade.sessions import DEFAULT_CLOSE, DEFAULT_LAST_ENTRY
 
-VERSION = 3
+VERSION = 4
 
 V1_STEPS: list[str] = [
     "ALTER TABLE accounts ADD COLUMN name TEXT NOT NULL DEFAULT ''",
@@ -132,6 +133,16 @@ V3_STEPS: list[str] = [
     # Au plus une décision par stratégie, par bougie et par type : dédoublonnage persistant.
     "CREATE UNIQUE INDEX one_signal_per_candle ON signals(activation_id, candle_open_time, kind)",
     "CREATE INDEX signals_by_account ON signals(account_id, id)",
+]
+
+V4_STEPS: list[str] = [
+    "ALTER TABLE accounts ADD COLUMN horizon TEXT NOT NULL DEFAULT 'intraday'",
+    "ALTER TABLE accounts ADD COLUMN fee_rate TEXT NOT NULL DEFAULT '0.001'",
+    # NULL : règle absente (comptes intraday).
+    "ALTER TABLE risk_limits ADD COLUMN max_week_loss_pct TEXT",
+    "ALTER TABLE risk_limits ADD COLUMN max_exposure_pct TEXT",
+    "ALTER TABLE pending_orders ADD COLUMN trail_distance TEXT",
+    "ALTER TABLE pending_orders ADD COLUMN trail_high TEXT",
 ]
 
 KEPT_TABLES = ("accounts", "positions", "orders")

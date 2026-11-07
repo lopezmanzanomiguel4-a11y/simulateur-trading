@@ -63,6 +63,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("montant", help="montant total en USDT, frais inclus")
     p.add_argument("--stop", required=True, help="prix du stop-loss, sous le bid")
     p.add_argument("--objectif", help="take-profit lié au stop (facultatif)")
+    p.add_argument("--suiveur", action="store_true", help="stop suiveur : monte avec le plus haut bid, distance = bid - stop")
 
     p = sub.add_parser("limite", parents=[acc], help="ordre limite (achat à l'ask <= prix, vente au bid >= prix)")
     p.add_argument("paire")
@@ -132,6 +133,8 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("nom")
     q.add_argument("capital", nargs="?", default=str(DEFAULT_CAPITAL))
     q.add_argument("--auto", action="store_true", help="compte automatique (soumis aux règles de session)")
+    q.add_argument("--swing", action="store_true", help="compte auto swing : positions conservées d'un jour à l'autre")
+    q.add_argument("--frais", default="0.1", help="frais en %% par ordre : 0.1 (défaut) ou 0.075 (BNB)")
     q = actions.add_parser("choisir", help="devient le compte courant")
     q.add_argument("nom")
     q = actions.add_parser("archiver", help="archive un compte (ses ordres en attente sont annulés)")
@@ -334,7 +337,9 @@ def print_pending(orders: Sequence[PendingOrder]) -> None:
 
 
 async def cmd_entrer(service: TradingService, args: argparse.Namespace) -> int:
-    result = await service.buy(args.paire, args.montant, compte=args.compte, stop=args.stop, target=args.objectif)
+    result = await service.buy(
+        args.paire, args.montant, compte=args.compte, stop=args.stop, target=args.objectif, trailing=args.suiveur
+    )
     print_trade(service, result)
     protection = service.storage.protection_orders(result.order.account_id, result.order.pair)
     print("Protection de la position :")
@@ -630,8 +635,12 @@ def cmd_reset(service: TradingService, args: argparse.Namespace) -> int:
 
 def cmd_comptes(service: TradingService, args: argparse.Namespace) -> int:
     if args.action == "creer":
-        a = service.create_account(args.nom, args.capital, AUTO if args.auto else MANUAL)
-        print(f"Compte '{a.name}' (n°{a.id}, {a.mode}) ouvert avec {fmt.usdt(a.initial_capital)}.")
+        a = service.create_account(
+            args.nom, args.capital, AUTO if args.auto or args.swing else MANUAL, "swing" if args.swing else "intraday",
+            args.frais,
+        )
+        extra = (", swing" if a.swing else "") + (f", frais {fmt.num(a.fee_rate * 100)} %" if a.fee_rate != FEE_RATE else "")
+        print(f"Compte '{a.name}' (n°{a.id}, {a.mode}{extra}) ouvert avec {fmt.usdt(a.initial_capital)}.")
         return 0
     if args.action == "choisir":
         a = service.select_account(args.nom)

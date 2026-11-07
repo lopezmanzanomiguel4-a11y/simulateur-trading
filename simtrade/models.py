@@ -85,6 +85,14 @@ MANUAL = "manuel"
 AUTO = "auto"
 MODES: tuple[str, ...] = (MANUAL, AUTO)
 
+# Horizon d'un compte : intraday (sessions, clôture forcée) ou swing (positions conservées d'un jour à l'autre).
+INTRADAY = "intraday"
+SWING = "swing"
+HORIZONS: tuple[str, ...] = (INTRADAY, SWING)
+FEE_STANDARD = Decimal("0.001")  # 0,1 % par ordre
+FEE_BNB = Decimal("0.00075")  # 0,075 % par ordre, frais payés en BNB
+FEE_RATES: tuple[Decimal, ...] = (FEE_STANDARD, FEE_BNB)
+
 
 @dataclass
 class Account:
@@ -96,6 +104,12 @@ class Account:
     mode: str = MANUAL  # un compte auto est soumis aux règles de session, un compte manuel jamais
     archived_at: datetime | None = None  # None : compte ouvert
     current: bool = True  # compte utilisé quand aucun n'est précisé
+    horizon: str = INTRADAY  # swing : pas de clôture forcée ni d'heure limite d'entrée
+    fee_rate: Decimal = FEE_STANDARD
+
+    @property
+    def swing(self) -> bool:
+        return self.horizon == SWING
 
     @property
     def archived(self) -> bool:
@@ -107,6 +121,7 @@ MARKET = "marche"
 LIMIT = "limite"
 STOP = "stop"
 TARGET = "objectif"
+TRAILING = "stop_suiveur"  # stop qui monte avec le plus haut atteint (bid), jamais ne descend
 SESSION_CLOSE = "cloture_session"
 LATE_SESSION_CLOSE = "cloture_tardive"
 
@@ -161,3 +176,6 @@ class PendingOrder:
     protection: bool = False
     stop_price: Decimal | None = None  # achat limite : stop de protection posé à l'exécution
     target_price: Decimal | None = None  # achat limite : objectif lié posé à l'exécution
+    # Stop suiveur : niveau = trail_high - trail_distance (trigger_price), distance figée à la pose.
+    trail_distance: Decimal | None = None
+    trail_high: Decimal | None = None  # plus haut bid retenu depuis la pose

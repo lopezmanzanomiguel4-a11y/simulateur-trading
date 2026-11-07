@@ -27,7 +27,7 @@ from simtrade.bricks import BrickResult, MarketView
 from simtrade.engine import FEE_RATE, normalize_pair, parse_decimal
 from simtrade.errors import InvalidInput
 from simtrade.market import Quality
-from simtrade.models import PAIRS
+from simtrade.models import HORIZONS, INTRADAY, PAIRS, SWING
 from simtrade.sessions import SessionRules, entry_allowed, parse_hhmm
 
 MODELS_DIR = Path(__file__).parent / "modeles"
@@ -39,6 +39,8 @@ MIN_TARGET_MARGIN_PCT = Decimal("0.10")
 MIN_TARGET_PCT = 2 * FEE_RATE * HUNDRED + MIN_TARGET_MARGIN_PCT  # 0,30 %
 STOP_MIN_PCT = Decimal("0.2")  # bornes d'un stop calculé (ATR, range) : au-delà, signal ignoré
 STOP_MAX_PCT = Decimal("3")
+SWING_STOP_MIN_PCT = Decimal("0.5")  # swing : stops larges (plusieurs ATR journaliers)
+SWING_STOP_MAX_PCT = Decimal("25")
 MAX_ENTRY_BRICKS = 4
 MAX_EXIT_BRICKS = 3
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")
@@ -133,7 +135,27 @@ GROUPS: dict[str, dict[str, Param]] = {
     "heures_actives": {"debut": _hour("00:00", "23:00", "06:00"), "fin": _hour("00:00", "23:00", "22:00")},
 }
 TOP: dict[str, Param] = {"paire": _choice(*PAIRS), "intervalle": _choice(*INTERVALS)}
-KEYS = ("nom", "paire", "intervalle", "entree", "sortie", "stop", "objectif", "taille", "heures_actives")
+
+# --- Swing (étape 7c) : positions de plusieurs jours, sans heures actives ni clôture de session ---
+SWING_INTERVALS = ("1h", "4h", "1d")
+SWING_ENTRY_BRICKS = ("rsi_extreme", "croisement_ema", "volatilite", "au_dessus_ema")
+SWING_EXIT_BRICKS = ("rsi_extreme", "croisement_ema", "duree_max")
+SWING_STOPS: dict[str, dict[str, Param]] = {
+    "pct": {"valeur": _dec("1", "25", "8")},
+    "atr": {"multiple": _dec("0.5", "6", "2"), "n": _int(5, 50, 14)},
+    "suiveur_pct": {"valeur": _dec("1", "25", "8")},
+    "suiveur_atr": {"multiple": _dec("0.5", "6", "3"), "n": _int(5, 50, 14)},
+}
+TRAILING_STOPS = ("suiveur_pct", "suiveur_atr")
+SWING_TARGETS: dict[str, dict[str, Param]] = {
+    "pct": {"valeur": _dec("1", "50", "10")},
+    "atr": {"multiple": _dec("1", "20", "6"), "n": _int(5, 50, 14)},
+    "r": {"multiple": _dec("1", "10", "3")},
+    "aucun": {},  # sortie par le stop (suiveur) ou les briques de sortie seulement
+}
+RISK_SIZE: dict[str, Param] = {"risque_pct": _dec("0.25", "2", "1")}  # taille au risque, en % de la valeur du compte
+SWING_TOP: dict[str, Param] = {"intervalle": Param("choix", "1d", choices=SWING_INTERVALS)}
+KEYS = ("nom", "paire", "intervalle", "entree", "sortie", "stop", "objectif", "taille", "heures_actives", "horizon")
 
 
 def schema() -> dict:
@@ -153,6 +175,16 @@ def schema() -> dict:
         "objectif_minimum_pct": _out(MIN_TARGET_PCT),
         "stop_calcule_pct": {"min": _out(STOP_MIN_PCT), "max": _out(STOP_MAX_PCT)},
         **{g: {k: p.json() for k, p in ps.items()} for g, ps in GROUPS.items()},
+        "horizons": list(HORIZONS),
+        "swing": {
+            "intervalle": SWING_TOP["intervalle"].json(),
+            "briques_entree": list(SWING_ENTRY_BRICKS),
+            "briques_sortie": list(SWING_EXIT_BRICKS),
+            "stop": {t: {k: p.json() for k, p in ps.items()} for t, ps in SWING_STOPS.items()},
+            "objectif": {t: {k: p.json() for k, p in ps.items()} for t, ps in SWING_TARGETS.items()},
+            "stop_calcule_pct": {"min": _out(SWING_STOP_MIN_PCT), "max": _out(SWING_STOP_MAX_PCT)},
+        },
+        "taille_risque": {k: p.json() for k, p in RISK_SIZE.items()},
     }
 
 
@@ -177,6 +209,16 @@ class Strategy:
     taille_pct: Decimal
     debut: time
     fin: time
+    horizon: str = INTRADAY
+    risque_pct: Decimal | None = None  # taille au risque (prioritaire sur taille_pct)
+
+    @property
+    def swing(self) -> bool:
+        return self.horizon == SWING
+
+    @property
+    def trailing(self) -> bool:
+        return self.stop.name in TRAILING_STOPS
 
     def brick(self, name: str) -> Brick | None:
         return next((b for b in self.entree + self.sortie if b.name == name), None)
@@ -190,7 +232,7 @@ class Strategy:
         def brick(b: Brick, key: str = "brique") -> dict:
             return {key: b.name, **{k: _out(v) for k, v in b.params.items()}}
 
-        return {
+        out = {
             "nom": self.nom,
             "paire": self.paire,
             "intervalle": self.intervalle,
@@ -198,9 +240,14 @@ class Strategy:
             "sortie": [brick(b) for b in self.sortie],
             "stop": brick(self.stop, "type"),
             "objectif": brick(self.objectif, "type"),
-            "taille": {"pct_capital": _out(self.taille_pct)},
-            "heures_actives": {"debut": _out(self.debut), "fin": _out(self.fin)},
+            "taille": {"risque_pct": _out(self.risque_pct)} if self.risque_pct is not None
+            else {"pct_capital": _out(self.taille_pct)},
         }
+        if self.swing:
+            out["horizon"] = SWING  # intraday : clé absente, forme canonique d'avant l'étape 7c
+        else:
+            out["heures_actives"] = {"debut": _out(self.debut), "fin": _out(self.fin)}
+        return out
 
     def dumps(self) -> str:
         return json.dumps(self.to_json(), ensure_ascii=False, sort_keys=False)
@@ -305,16 +352,21 @@ def validate(raw: Any) -> Strategy:
     except InvalidInput:
         pair = pair_raw
     pair = _value(TOP["paire"], pair, "paire")
-    interval = _value(TOP["intervalle"], raw.get("intervalle", TOP["intervalle"].default), "intervalle")
+    horizon = raw.get("horizon", INTRADAY)
+    if horizon not in HORIZONS:
+        raise _err("horizon", f"invalide : {horizon!r} (choix : {', '.join(HORIZONS)}).")
+    swing = horizon == SWING
+    top = SWING_TOP if swing else TOP
+    interval = _value(top["intervalle"], raw.get("intervalle", top["intervalle"].default), "intervalle")
     if "entree" not in raw:
         raise _err("entree", "manquante (au moins une brique).")
-    entry = _bricks(raw["entree"], "entree", ENTRY_BRICKS, MAX_ENTRY_BRICKS, 1)
-    exits = _bricks(raw.get("sortie", []), "sortie", EXIT_BRICKS, MAX_EXIT_BRICKS, 0)
+    entry = _bricks(raw["entree"], "entree", SWING_ENTRY_BRICKS if swing else ENTRY_BRICKS, MAX_ENTRY_BRICKS, 1)
+    exits = _bricks(raw.get("sortie", []), "sortie", SWING_EXIT_BRICKS if swing else EXIT_BRICKS, MAX_EXIT_BRICKS, 0)
     for key in ("stop", "objectif"):
         if key not in raw:
             raise _err(key, "manquant.")
-    stop = _typed(raw["stop"], "stop", STOPS)
-    target = _typed(raw["objectif"], "objectif", TARGETS)
+    stop = _typed(raw["stop"], "stop", SWING_STOPS if swing else STOPS)
+    target = _typed(raw["objectif"], "objectif", SWING_TARGETS if swing else TARGETS)
     has_range = any(b.name == "cassure_range" for b in entry)
     if stop.name == "range" and not has_range:
         raise _err("stop.type", "'range' demande la brique cassure_range dans l'entrée.")
@@ -322,11 +374,25 @@ def validate(raw: Any) -> Strategy:
         raise _err("entree.hauteur_range", "demande la brique cassure_range dans l'entrée.")
     if any(b.name == "retour_dans_range" for b in exits) and not has_range:
         raise _err("sortie.retour_dans_range", "demande la brique cassure_range dans l'entrée.")
-    size = _params(GROUPS["taille"], _mapping(raw.get("taille", {}), "taille"), "taille")
+    size_raw = _mapping(raw.get("taille", {}), "taille")
+    risk_pct = None
+    if "risque_pct" in size_raw:
+        if "pct_capital" in size_raw:
+            raise _err("taille", "soit pct_capital, soit risque_pct, pas les deux.")
+        risk_pct = _params(RISK_SIZE, size_raw, "taille")["risque_pct"]
+        size = {"pct_capital": GROUPS["taille"]["pct_capital"].default}
+    else:
+        size = _params(GROUPS["taille"], size_raw, "taille")
+    if swing:
+        if "heures_actives" in raw:
+            raise _err("heures_actives", "interdites en swing (positions conservées jour et nuit).")
+        return Strategy(name, pair, interval, entry, exits, stop, target, size["pct_capital"], time(0, 0),
+                        time(23, 59), SWING, risk_pct)
     hours = _params(GROUPS["heures_actives"], _mapping(raw.get("heures_actives", {}), "heures_actives"), "heures_actives")
     if hours["debut"] >= hours["fin"]:
         raise _err("heures_actives.debut", f"doit être avant la fin ({_out(hours['debut'])} >= {_out(hours['fin'])}).")
-    return Strategy(name, pair, interval, entry, exits, stop, target, size["pct_capital"], hours["debut"], hours["fin"])
+    return Strategy(name, pair, interval, entry, exits, stop, target, size["pct_capital"], hours["debut"], hours["fin"],
+                    INTRADAY, risk_pct)
 
 
 def loads(text: str) -> Strategy:
@@ -398,6 +464,8 @@ class Plan:
     stop_level: Decimal | None  # niveau absolu (range)
     target_pct: Decimal | None  # distance de l'objectif en % (pct, atr)
     target_r: Decimal | None  # multiple de la distance du stop (r)
+    trailing: bool = False  # stop suiveur : distance figée à l'entrée = bid - stop initial
+    swing: bool = False  # bornes de stop swing
 
 
 @dataclass(frozen=True)
@@ -424,9 +492,9 @@ def _plan(strategy: Strategy, view: MarketView) -> Plan | None:
     candles = bricks.closed(view.candles, view.now)
     stop, target = strategy.stop, strategy.objectif
     stop_pct = stop_level = target_pct = target_r = None
-    if stop.name == "pct":
+    if stop.name in ("pct", "suiveur_pct"):
         stop_pct = stop.params["valeur"]
-    elif stop.name == "atr":
+    elif stop.name in ("atr", "suiveur_atr"):
         value = bricks.atr_pct(candles, stop.params["n"])
         if value is None:
             return None
@@ -447,9 +515,9 @@ def _plan(strategy: Strategy, view: MarketView) -> Plan | None:
         if value is None:
             return None
         target_pct = value * target.params["multiple"]
-    else:
+    elif target.name == "r":
         target_r = target.params["multiple"]
-    return Plan(stop_pct, stop_level, target_pct, target_r)
+    return Plan(stop_pct, stop_level, target_pct, target_r, strategy.trailing, strategy.swing)
 
 
 def plan(strategy: Strategy, view: MarketView) -> Plan | None:
@@ -495,10 +563,11 @@ def evaluate(strategy: Strategy, view: MarketView, entered_at: datetime | None =
 @dataclass(frozen=True)
 class Levels:
     stop: Decimal
-    target: Decimal
+    target: Decimal | None  # None : objectif 'aucun' (swing)
     stop_pct: Decimal
-    target_pct: Decimal
+    target_pct: Decimal | None
     reasons: tuple[str, ...]  # vide : niveaux acceptés
+    trail_distance: Decimal | None = None  # stop suiveur : bid à l'entrée - stop initial
 
 
 def min_target_pct(spread_pct: Decimal) -> Decimal:
@@ -513,15 +582,23 @@ def levels(plan: Plan, ask: Decimal, bid: Decimal) -> Levels:
     else:
         stop = (ask * (1 - plan.stop_pct / HUNDRED)).quantize(TICK, rounding=ROUND_FLOOR)  # type: ignore[operator]
     stop_pct = (ask - stop) / ask * HUNDRED
-    target_pct = plan.target_pct if plan.target_pct is not None else plan.target_r * stop_pct  # type: ignore[operator]
-    target = (ask * (1 + target_pct / HUNDRED)).quantize(TICK, rounding=ROUND_CEILING)
+    if plan.target_pct is not None:
+        target_pct = plan.target_pct
+    elif plan.target_r is not None:
+        target_pct = plan.target_r * stop_pct
+    else:
+        target_pct = None
+    target = None if target_pct is None else (ask * (1 + target_pct / HUNDRED)).quantize(TICK, rounding=ROUND_CEILING)
     reasons = []
-    if not STOP_MIN_PCT <= stop_pct <= STOP_MAX_PCT:
+    low, high = (SWING_STOP_MIN_PCT, SWING_STOP_MAX_PCT) if plan.swing else (STOP_MIN_PCT, STOP_MAX_PCT)
+    if not low <= stop_pct <= high:
         reasons.append(STOP_OUT_OF_BOUNDS)
     spread_pct = (ask - bid) / ((ask + bid) / 2) * HUNDRED
-    if (target - ask) / ask * HUNDRED < min_target_pct(spread_pct):
+    if target is not None and (target - ask) / ask * HUNDRED < min_target_pct(spread_pct):
         reasons.append(TARGET_TOO_CLOSE)
-    return Levels(stop, target, _round(stop_pct), _round(target_pct), tuple(reasons))
+    trail = bid - stop if plan.trailing and bid > stop else None
+    return Levels(stop, target, _round(stop_pct), None if target_pct is None else _round(target_pct), tuple(reasons),
+                  trail)
 
 
 def _round(value: Decimal) -> Decimal:
@@ -537,10 +614,12 @@ def entry_blockers(
 ) -> tuple[str, ...]:
     """Raisons d'ignorer un signal d'entrée, hors qualité des données."""
     reasons = []
-    if not in_hours(strategy, now):
-        reasons.append(OUT_OF_HOURS)
-    if not entry_allowed(now, rules):
-        reasons.append(AFTER_LAST_ENTRY)
+    if not strategy.swing:  # swing : ni heures actives ni heure limite d'entrée
+        if not in_hours(strategy, now):
+            reasons.append(OUT_OF_HOURS)
+        if not entry_allowed(now, rules):
+            reasons.append(AFTER_LAST_ENTRY)
+
     if has_position:
         reasons.append(ALREADY_IN)
     if halted:

@@ -22,7 +22,7 @@ import logging
 import sqlite3
 from collections.abc import AsyncIterator, Callable, Iterable, Sequence
 from dataclasses import dataclass, replace
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import ROUND_DOWN, Decimal
 from typing import Any, TypeVar
 
@@ -30,7 +30,7 @@ from simtrade import fmt
 from simtrade import orders as rules_orders
 from simtrade import strategies
 from simtrade.dbworker import DbWorker
-from simtrade.engine import DEFAULT_CAPITAL, Portfolio, Valuation, normalize_pair
+from simtrade.engine import DEFAULT_CAPITAL, Portfolio, Valuation, normalize_pair, parse_fee_rate
 from simtrade.errors import FeedUnavailable, InvalidInput, OrderRejected
 from simtrade.feeds.base import PriceFeed
 from simtrade.models import (
@@ -46,6 +46,7 @@ from simtrade.models import (
     SESSION_CLOSE,
     STOP,
     TARGET,
+    TRAILING,
     Account,
     Order,
     PendingOrder,
@@ -59,6 +60,7 @@ from simtrade.risk import (
     MARKET_ENTRY,
     MAX_LOSS,
     STOP_ALREADY_HIT,
+    risk_size,
     EntryRequest,
     RiskLimits,
     RiskRefused,
@@ -84,6 +86,7 @@ T = TypeVar("T")
 ENTRY = "entree"
 EXIT = "sortie"
 ORDER = "ordre"
+WEEK = timedelta(days=7)  # fenêtre glissante de la perte max swing
 ALL = 10**9  # « sans limite » pour les lectures du journal
 REFUSED = "refuse"
 IGNORED = "ignore"
@@ -174,10 +177,12 @@ class TradingService:
     # --- Ordres au marché ---
 
     async def buy(
-        self, pair: str, amount_usdt: object, *, compte: object = None, stop: object = None, target: object = None
+        self, pair: str, amount_usdt: object, *, compte: object = None, stop: object = None, target: object = None,
+        trailing: bool = False,
     ) -> TradeResult:
         """Achat au marché ; avec `stop` (et `target`), pose en plus le stop de protection de la paire,
-        dans la même transaction. Obligatoire sur un compte automatique."""
+        dans la même transaction. Obligatoire sur un compte automatique.
+        `trailing` : le stop est un stop suiveur, distance figée = bid à l'achat - stop."""
         pair = normalize_pair(pair)
         stop_price = None if stop is None else rules_orders.parse_price(stop, "Stop")
         target_price = None if target is None else rules_orders.parse_price(target, "Objectif")
@@ -185,7 +190,10 @@ class TradingService:
         quote = (await self.feed.snapshot([pair]))[pair]
         quotes = await self._fresh_quotes(held)
         quotes[pair] = quote
-        return await self.run(self._buy, compte, pair, amount_usdt, stop_price, target_price, quotes)
+        if trailing and stop_price is None:
+            raise InvalidInput("Un stop suiveur demande un stop initial.")
+        trail = quote.bid - stop_price if trailing and stop_price is not None and quote.bid > stop_price else None
+        return await self.run(self._buy, compte, pair, amount_usdt, stop_price, target_price, quotes, trail)
 
     buy_with_stop = buy
 
@@ -204,9 +212,10 @@ class TradingService:
         stop: Decimal | None,
         target: Decimal | None,
         quotes: dict[str, Quote],
+        trail_distance: Decimal | None = None,
     ) -> TradeResult:
         try:
-            result = self._buy_unlogged(compte, pair, amount_usdt, stop, target, quotes)
+            result = self._buy_unlogged(compte, pair, amount_usdt, stop, target, quotes, trail_distance)
         except RiskRefused as exc:
             self._log_refusal(exc.record)
             raise
@@ -222,6 +231,7 @@ class TradingService:
         stop: Decimal | None,
         target: Decimal | None,
         quotes: dict[str, Quote],
+        trail_distance: Decimal | None = None,
     ) -> TradeResult:
         """Achat (+ stop de protection) dans une transaction, ou dans celle de l'appelant s'il en a ouvert une.
         Un refus du garde-fou est levé SANS être journalisé : à l'appelant de l'écrire après le ROLLBACK."""
@@ -240,7 +250,7 @@ class TradingService:
             order = portfolio.buy(quote, amount, now)
             saved = self.storage.save_trade(portfolio, order)
             if stop is not None:
-                self._set_protection(account, pair, stop, target, now)
+                self._set_protection(account, pair, stop, target, now, trail_distance)
         return TradeResult(saved, portfolio.account.cash)
 
     async def sell(self, pair: str, quantity: object, *, compte: object = None) -> TradeResult:
@@ -272,8 +282,8 @@ class TradingService:
         return portfolio
 
     def _check_entry(self, account: Account) -> None:
-        """Compte auto : aucune entrée après l'heure limite de la session."""
-        if account.mode != AUTO:
+        """Compte auto intraday : aucune entrée après l'heure limite de la session (swing : jamais limité)."""
+        if account.mode != AUTO or account.swing:
             return
         rules = self.storage.session_rules()
         if not entry_allowed(self.clock(), rules):
@@ -311,6 +321,8 @@ class TradingService:
         for p in pending_buys:
             exposure[p.pair] = exposure.get(p.pair, Decimal(0)) + (p.amount or Decimal(0))
         today = [o for o in orders if session_date(o.created_at) == day]
+        week_start = now - WEEK
+        week_realized = sum((o.realized_pnl for o in orders if o.created_at > week_start), Decimal(0))
         last_entry: dict[str, datetime] = {}
         for pair, at in [(o.pair, o.created_at) for o in orders if o.side is Side.BUY] + [
             (p.pair, p.created_at) for p in pending_buys
@@ -324,6 +336,7 @@ class TradingService:
             last_entry=last_entry,
             halted=self.storage.session_halted(account.id, day),
             stale=tuple(sorted(stale)),
+            week_pnl=week_realized + unrealized,
         )
 
     def _guard(
@@ -395,7 +408,7 @@ class TradingService:
         return [
             (a, list(self.storage.load_portfolio(a.id).positions))
             for a in self.storage.open_accounts()
-            if a.mode == AUTO and not self.storage.session_halted(a.id, day)
+            if a.mode == AUTO and not a.swing and not self.storage.session_halted(a.id, day)
         ]
 
     def _maybe_halt(self, account: Account, quotes: dict[str, Quote]) -> bool:
@@ -419,20 +432,26 @@ class TradingService:
             rules_orders.check_new(TARGET, Side.SELL, pair, target, quote)
 
     def _set_protection(
-        self, account: Account, pair: str, stop: Decimal, target: Decimal | None, now: datetime
+        self, account: Account, pair: str, stop: Decimal, target: Decimal | None, now: datetime,
+        trail_distance: Decimal | None = None,
     ) -> list[PendingOrder]:
         """Pose (ou remplace) LE stop de protection de la paire, avec son objectif éventuel.
 
-        Compte auto : le stop ne baisse jamais, une nouvelle entrée garde max(ancien stop, nouveau stop)."""
+        Compte auto : le stop ne baisse jamais, une nouvelle entrée garde max(ancien stop, nouveau stop).
+        Avec `trail_distance` : stop suiveur, plus haut retenu = stop + distance (niveau initial = stop)."""
         account_id = account.id
         old_orders = self.storage.protection_orders(account_id, pair)
         if account.mode == AUTO:
-            stop = max([stop] + [o.trigger_price for o in old_orders if o.kind == STOP])
+            stop = max([stop] + [o.trigger_price for o in old_orders if o.kind in rules_orders.STOP_KINDS])
             if target is not None and target <= stop:
                 target = None  # objectif sous le stop conservé : il n'aurait plus de sens
         for old in old_orders:
             self.storage.close_pending(old.id, CANCELLED, "remplace", now)
-        legs = [PendingOrder(account_id, pair, STOP, Side.SELL, stop, None, None, now, protection=True)]
+        if trail_distance is not None:
+            legs = [PendingOrder(account_id, pair, TRAILING, Side.SELL, stop, None, None, now, protection=True,
+                                 trail_distance=trail_distance, trail_high=stop + trail_distance)]
+        else:
+            legs = [PendingOrder(account_id, pair, STOP, Side.SELL, stop, None, None, now, protection=True)]
         if target is not None:
             legs.append(PendingOrder(account_id, pair, TARGET, Side.SELL, target, None, None, now, protection=True))
         return self.storage.add_pending(legs)
@@ -642,7 +661,7 @@ class TradingService:
             if order.protection:
                 account = self.storage.account(order.account_id, open_only=False)
                 held = order.pair in self.storage.load_portfolio(account.id).positions
-                if order.kind == STOP and account.mode == AUTO and held:
+                if order.kind in rules_orders.STOP_KINDS and account.mode == AUTO and held:
                     raise OrderRejected(
                         f"Le stop n°{number} protège la position {order.pair} du compte automatique "
                         f"'{account.name}' : il ne peut pas être annulé tant qu'elle est ouverte. "
@@ -659,7 +678,22 @@ class TradingService:
         account = self.storage.account(compte, open_only=False)
         return self.storage.pending_orders(account.id, all_statuses=all_statuses)
 
+    def raise_trail(self, pending_id: int, high: Decimal) -> PendingOrder | None:
+        """Relève un stop suiveur avec un nouveau plus haut (bid de la bougie 1h close) ; None s'il ne monte pas."""
+        with self.storage.transaction():
+            order = self.storage.get_pending(pending_id)
+            if order is None or order.status != PENDING:
+                return None
+            raised = rules_orders.raise_trail(order, high)
+            if raised is None:
+                return None
+            self.storage.set_trail(order.id, *raised)
+        self._notify()
+        log.info("Stop suiveur n°%s relevé à %s (plus haut %s).", pending_id, raised[1], raised[0])
+        return replace(order, trail_high=raised[0], trigger_price=raised[1])
+
     def watched_orders(self) -> list[PendingOrder]:
+
         """Tous les ordres en attente des comptes ouverts (ceux des comptes archivés sont annulés)."""
         return self.storage.pending_orders()
 
@@ -694,7 +728,7 @@ class TradingService:
         portfolio = self.storage.load_portfolio(account.id, exclude_pending=pending.id)
         try:
             if pending.side is Side.BUY:
-                if account.mode == AUTO and not entry_allowed(now, self.storage.session_rules()):
+                if account.mode == AUTO and not account.swing and not entry_allowed(now, self.storage.session_rules()):
                     close(REJECTED, "hors_session")
                     return None
                 if pending.stop_price is not None and quote.bid <= pending.stop_price:
@@ -771,7 +805,7 @@ class TradingService:
 
     def session_due(self, account: Account, now: datetime | None = None) -> datetime | None:
         """Début de la session à fermer (activité la plus ancienne) si sa clôture est passée, sinon None."""
-        if account.mode != AUTO or account.archived:
+        if account.mode != AUTO or account.swing or account.archived:
             return None
         now = now or self.clock()
         if not self.storage.load_portfolio(account.id).positions and not self.storage.pending_orders(account.id):
@@ -847,6 +881,11 @@ class TradingService:
             if account.mode != AUTO:
                 raise InvalidInput(
                     f"Le compte '{account.name}' est manuel : une stratégie ne s'active que sur un compte automatique."
+                )
+            if strategy.horizon != account.horizon:
+                raise InvalidInput(
+                    f"La stratégie {strategy.nom} est {strategy.horizon} et le compte '{account.name}' est "
+                    f"{account.horizon} : une stratégie ne s'active que sur un compte du même horizon."
                 )
             record = self.storage.activate_strategy(account.id, strategy.nom, strategy.dumps(), self.clock())
         log.info("Stratégie %s activée sur le compte %s.", strategy.nom, account.name)
@@ -1014,26 +1053,37 @@ class TradingService:
         strategy = strategies.loads(activation.definition)
         quote = quotes[strategy.paire]
         levels = strategies.levels(plan, quote.ask, quote.bid)
-        amount = (self._equity(activation.account_id, quotes) * strategy.taille_pct / 100).quantize(
-            Decimal("0.01"), rounding=ROUND_DOWN
-        )
+        equity = self._equity(activation.account_id, quotes)
+        if strategy.risque_pct is not None:
+            account = self.storage.account(activation.account_id)
+            amount = Decimal(0)
+            if levels.stop < quote.ask:
+                amount = risk_size(
+                    equity, self.storage.load_portfolio(account.id).free_cash, quote.ask, levels.stop,
+                    strategy.risque_pct, self.storage.risk_limits(account.id).max_position_pct, account.fee_rate,
+                )
+        else:
+            amount = (equity * strategy.taille_pct / 100).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
         details = {
             **details,
             "bid": str(quote.bid),
             "ask": str(quote.ask),
             "stop": str(levels.stop),
-            "objectif": str(levels.target),
+            "objectif": None if levels.target is None else str(levels.target),
             "stop_pct": str(levels.stop_pct),
-            "objectif_pct": str(levels.target_pct),
+            "objectif_pct": None if levels.target_pct is None else str(levels.target_pct),
             "montant": str(amount),
         }
+        if levels.trail_distance is not None:
+            details["distance_suiveur"] = str(levels.trail_distance)
         signal = self._signal(activation, strategy, candle_open, ENTRY, details)
         if levels.reasons:
             return self._save_signal(replace(signal, reasons=levels.reasons))
         try:
             with self.storage.transaction():
                 result = self._buy_unlogged(
-                    activation.account_id, strategy.paire, amount, levels.stop, levels.target, quotes
+                    activation.account_id, strategy.paire, amount, levels.stop, levels.target, quotes,
+                    levels.trail_distance if strategy.trailing else None,
                 )
                 saved = self.storage.add_signal(replace(signal, decision=ORDER, order_id=result.order.id))
         except RiskRefused as exc:
@@ -1107,8 +1157,11 @@ class TradingService:
     def open_accounts(self) -> list[Account]:
         return self.storage.open_accounts()
 
-    def create_account(self, name: object, capital: object = DEFAULT_CAPITAL, mode: str = MANUAL) -> Account:
-        return self.storage.create_account(name, capital, mode, self.clock())
+    def create_account(
+        self, name: object, capital: object = DEFAULT_CAPITAL, mode: str = MANUAL, horizon: str = "intraday",
+        frais: object = "0.1",
+    ) -> Account:
+        return self.storage.create_account(name, capital, mode, self.clock(), horizon, parse_fee_rate(frais))
 
     def select_account(self, compte: object) -> Account:
         return self.storage.select_account(compte)
