@@ -86,6 +86,9 @@ AUTO = "auto"
 MODES: tuple[str, ...] = (MANUAL, AUTO)
 
 # Horizon d'un compte : intraday (sessions, clôture forcée) ou swing (positions conservées d'un jour à l'autre).
+# Univers du swing (données 1h et backtest) ; le live reste sur PAIRS tant qu'aucun modèle swing n'est validé.
+SWING_PAIRS = ("BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT", "DOGEUSDT", "AVAXUSDT", "LINKUSDT",
+               "LTCUSDT")
 INTRADAY = "intraday"
 SWING = "swing"
 HORIZONS: tuple[str, ...] = (INTRADAY, SWING)

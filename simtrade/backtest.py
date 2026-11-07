@@ -16,6 +16,16 @@ Règles d'exécution (D9 de RAPPORT-ETAPE7, détaillées au README) :
   minute de l'exécution absente : signal ignoré (`pas_de_cotation_fraiche`) ;
 - arrêt de session (perte max) : vérifié au plus bas de chaque minute en position (bas × (1 − s/2), même règle
   prudente que les stops ; le live voit chaque cotation) et après chaque vente.
+
+Swing (stratégie `horizon: swing`, étape 7c) : mêmes règles, sur des klines 1h au lieu de 1m :
+- la barre de base est l'heure : décision à la clôture T de la bougie 1h / 4h / 1d (fenêtre SWING_BARS),
+  exécution à l'ouverture de la barre 1h qui commence en T ; stop / objectif testés sur chaque barre 1h ;
+- pas de clôture de session ni d'heure limite d'entrée, pas d'arrêt de session ;
+- stop suiveur : sur chaque barre, test du stop au niveau d'AVANT (ouverture puis bas), puis seulement
+  relèvement avec le haut de la barre au bid : plus haut retenu = max(plus haut, haut × (1 − s/2)),
+  niveau = max(niveau, plus haut − distance) ; distance figée à l'entrée ;
+- garde-fou swing (SWING_LIMITS par défaut) : perte sur 7 jours glissants (réalisé + latent), exposition ;
+- taille au risque si `taille.risque_pct` ; courbe de valeur à la fin de chaque heure.
 """
 
 from __future__ import annotations
@@ -35,9 +45,13 @@ from simtrade import trades as trades_mod
 from simtrade.bricks import MarketView
 from simtrade.engine import FEE_RATE, Portfolio
 from simtrade.errors import InvalidInput, OrderRejected
-from simtrade.market import INTERVALS, MAX_CANDLES, Candle, aggregate, bucket_start, session_start
-from simtrade.models import AUTO, LATE_SESSION_CLOSE, MARKET, SESSION_CLOSE, STOP, TARGET, Account, Order, Quote, Side
-from simtrade.risk import MARKET_ENTRY, MAX_LOSS, EntryRequest, RiskLimits, RiskState, check_entry, loss_breached
+from simtrade.market import BAR_SECONDS, INTERVALS, MAX_CANDLES, Candle, aggregate, bucket_start, session_start
+from simtrade.models import (
+    AUTO, LATE_SESSION_CLOSE, MARKET, SESSION_CLOSE, STOP, TARGET, TRAILING, Account, Order, Quote, Side,
+)
+from simtrade.risk import (
+    MARKET_ENTRY, MAX_LOSS, SWING_LIMITS, EntryRequest, RiskLimits, RiskState, check_entry, loss_breached, risk_size,
+)
 from simtrade.service import ENTRY, EXIT, IGNORED, IMPOSSIBLE, ORDER, REFUSED
 from simtrade.sessions import SessionRules, close_time, is_late, session_date
 from simtrade.strategies import Evaluation, Plan, Strategy
@@ -46,6 +60,7 @@ SOURCE = "backtest"
 MINUTE = timedelta(minutes=1)
 DECISION_DELAY = timedelta(seconds=1)  # ordre sur signal : T + 1 s
 INTRA_MINUTE = timedelta(seconds=30)  # stop / objectif touché pendant la minute : daté du milieu de la minute
+WEEK = timedelta(days=7)
 PARTIAL_HISTORY = "historique_partiel"
 DEFAULT_SPREAD_PCT = Decimal("0.02")
 HUNDRED = Decimal(100)
@@ -83,27 +98,40 @@ class BacktestConfig:
 
 
 class Market:
-    """Klines 1m triées d'une paire, bougies de l'intervalle agrégées, et index des fenêtres du live."""
+    """Klines de base triées d'une paire (1m ; 1h pour le swing), bougies de l'intervalle agrégées, et index
+    des fenêtres du live. `ones`, `by_minute` : les bougies de base (des heures en swing)."""
 
     def __init__(self, candles_1m: Sequence[Candle], interval: str):
         ones = sorted((c for c in candles_1m if c.interval == "1m"), key=lambda c: c.open_time)
+        base = "1m"
+        if not ones:
+            ones = sorted((c for c in candles_1m if c.interval == "1h"), key=lambda c: c.open_time)
+            base = "1h"
         if not ones:
             raise InvalidInput("Backtest : aucune bougie 1m.")
-        if interval not in INTERVALS or interval == "1m":
+        if base == "1m" and (interval not in INTERVALS or interval == "1m"):
             raise InvalidInput(f"Backtest : intervalle invalide '{interval}'.")
+        if base == "1h" and interval not in strategies.SWING_INTERVALS:
+            raise InvalidInput(f"Backtest swing : intervalle invalide '{interval}' (1h, 4h ou 1d).")
         self.pair = ones[0].pair
         self.interval = interval
-        self.step = timedelta(seconds=INTERVALS[interval])
+        self.base = base
+        self.base_step = timedelta(seconds=BAR_SECONDS[base])
+        self.step = timedelta(seconds=BAR_SECONDS[interval])
         self.ones = ones
         self.one_times = [c.open_time for c in ones]
         self.by_minute = {c.open_time: c for c in ones}
-        self.bars = aggregate(ones, interval)
+        self.bars = ones if interval == base else aggregate(ones, interval)
         self.bar_by_close = {c.close_time: k for k, c in enumerate(self.bars)}
         self._bad = [0]
         for c in self.bars:
             self._bad.append(self._bad[-1] + (0 if c.complete else 1))
-        self.n_bars = MAX_CANDLES[interval] - 1
-        self.n_ones = MAX_CANDLES["1m"] - 1
+        if base == "1m":
+            self.n_bars = MAX_CANDLES[interval] - 1
+            self.n_ones = MAX_CANDLES["1m"] - 1
+        else:  # swing : pas de série 1m dans la vue (aucune brique swing ne la lit)
+            self.n_bars = strategies.SWING_BARS[interval]
+            self.n_ones = 0
 
     @property
     def first(self) -> datetime:
@@ -116,11 +144,11 @@ class Market:
             return None
         k0 = max(0, k - self.n_bars + 1)
         bars = self.bars[k0 : k + 1]
-        i0 = bisect.bisect_left(self.one_times, at - self.n_ones * MINUTE)
+        i0 = bisect.bisect_left(self.one_times, at - self.n_ones * self.base_step)
         i1 = bisect.bisect_left(self.one_times, at)
         ones = self.ones[i0:i1]
         from_bars = at - self.n_bars * self.step
-        from_ones = at - self.n_ones * MINUTE
+        from_ones = at - self.n_ones * self.base_step
         if not full:
             from_bars = max(from_bars, bucket_start(self.first, int(self.step.total_seconds())))
             from_ones = max(from_ones, self.first)
@@ -128,7 +156,7 @@ class Market:
             bars[0].open_time != from_bars
             or len(bars) != (at - from_bars) // self.step
             or self._bad[k + 1] - self._bad[k0] > 0
-            or len(ones) != (at - from_ones) // MINUTE
+            or len(ones) != (at - from_ones) // self.base_step
         )
         return MarketView(at, bars, ones), partial
 
@@ -213,7 +241,11 @@ class _Sim:
         self.pf = Portfolio(
             Account(None, config.capital, config.capital, market.first, "backtest", AUTO), fee_rate=config.fee_rate
         )
-        self.protection: tuple[Decimal, Decimal] | None = None  # (stop, objectif) de la position ouverte
+        self.protection: tuple[Decimal, Decimal | None] | None = None  # (stop, objectif) de la position ouverte
+        self.trail: tuple[Decimal, Decimal] | None = None  # stop suiveur : (distance figée, plus haut retenu au bid)
+        self.swing = strategy.swing
+        self.intra = market.base_step / 2  # stop / objectif touché pendant la barre : daté de son milieu
+        self.sells: list[tuple[datetime, Decimal]] = []  # (date, réalisé) : perte sur 7 jours du swing
         self.entered_at: datetime | None = None
         self.orders: list[Order] = []
         self.signals: list[Signal] = []
@@ -256,14 +288,17 @@ class _Sim:
         order = self._record(replace(order, kind=kind, trigger_price=trigger, slippage=slip))
         day = session_date(at)
         self.realized[day] = self.realized.get(day, Decimal(0)) + order.realized_pnl
+        self.sells.append((at, order.realized_pnl))
         self.protection = None
+        self.trail = None
         self.entered_at = None
         self._halt_check(day, None)
         return order
 
     def _halt_check(self, day: date, price: Decimal | None) -> None:
-        """Arrêt de session si la perte max est atteinte, la position marquée au bid estimé de `price`."""
-        if day in self.halted:
+        """Arrêt de session si la perte max est atteinte, la position marquée au bid estimé de `price`.
+        Swing : pas d'arrêt de session (la perte sur 7 jours bloque les entrées dans check_entry)."""
+        if self.swing or day in self.halted:
             return
         unrealized = Decimal(0)
         equity = self.pf.account.cash
@@ -279,7 +314,13 @@ class _Sim:
             self.halted.add(day)
 
     def _session_due(self, t: datetime) -> bool:
+        if self.swing:
+            return False
         return self.entered_at is not None and t >= close_time(session_date(self.entered_at), self.c.rules)
+
+    @property
+    def _stop_kind(self) -> str:
+        return STOP if self.trail is None else TRAILING
 
     def _open(self, c: Candle, t: datetime) -> None:
         """Ouverture de la minute : clôture de session due, ou stop / objectif déjà dépassés."""
@@ -290,17 +331,27 @@ class _Sim:
         stop, target = self.protection  # type: ignore[misc]
         bid = self.c.bid(c.open)
         if bid <= stop:
-            self._sell(bid, t, STOP, stop)
-        elif bid >= target:
+            self._sell(bid, t, self._stop_kind, stop)
+        elif target is not None and bid >= target:
             self._sell(bid, t, TARGET, target)
 
     def _inside(self, c: Candle, t: datetime) -> None:
-        """Pendant la minute : stop d'abord (prudent), puis objectif, exécutés à leur niveau."""
+        """Pendant la barre : stop d'abord (prudent), puis objectif, exécutés à leur niveau ; ensuite
+        seulement, relèvement du stop suiveur avec le haut de la barre (jamais avant le test)."""
         stop, target = self.protection  # type: ignore[misc]
         if self.c.bid(c.low) <= stop:
-            self._sell(stop, t + INTRA_MINUTE, STOP, stop)
-        elif self.c.bid(c.high) >= target:
-            self._sell(target, t + INTRA_MINUTE, TARGET, target)
+            self._sell(stop, t + self.intra, self._stop_kind, stop)
+        elif target is not None and self.c.bid(c.high) >= target:
+            self._sell(target, t + self.intra, TARGET, target)
+        elif self.trail is not None:
+            self._raise_trail(self.c.bid(c.high))
+
+    def _raise_trail(self, high: Decimal) -> None:
+        distance, kept = self.trail  # type: ignore[misc]
+        kept = max(kept, high)
+        self.trail = (distance, kept)
+        stop, target = self.protection  # type: ignore[misc]
+        self.protection = (max(stop, kept - distance), target)
 
     # --- Décision à la clôture ---
 
@@ -389,6 +440,8 @@ class _Sim:
             exposure[pair] = value
             equity += value
             unrealized += value - position.cost_basis
+        week_start = now - WEEK
+        week = sum((pnl for at, pnl in self.sells if at > week_start), Decimal(0))
         return RiskState(
             equity=equity,
             session_pnl=self.realized.get(day, Decimal(0)) + unrealized,
@@ -396,6 +449,7 @@ class _Sim:
             exposure=exposure,
             last_entry=dict(self.last_entry),
             halted=day in self.halted,
+            week_pnl=week + unrealized,
         )
 
     def _enter(self, now: datetime, candle_open: datetime, c: Candle, plan: Plan) -> None:
@@ -403,9 +457,17 @@ class _Sim:
         quote = self.c.quote(pair, c.open, now)
         levels = strategies.levels(plan, quote.ask, quote.bid)
         state = self._risk_state(now, quote.bid)
-        amount = (state.equity * self.s.taille_pct / HUNDRED).quantize(CENT, rounding=ROUND_DOWN)
+        if self.s.risque_pct is not None:
+            amount = Decimal(0)
+            if levels.stop < quote.ask:
+                amount = risk_size(state.equity, self.pf.free_cash, quote.ask, levels.stop, self.s.risque_pct,
+                                   self.c.limits.max_position_pct, self.c.fee_rate)
+        else:
+            amount = (state.equity * self.s.taille_pct / HUNDRED).quantize(CENT, rounding=ROUND_DOWN)
         details = {"bid": str(quote.bid), "ask": str(quote.ask), "stop": str(levels.stop),
-                   "objectif": str(levels.target), "montant": str(amount)}
+                   "objectif": None if levels.target is None else str(levels.target), "montant": str(amount)}
+        if levels.trail_distance is not None:
+            details["distance_suiveur"] = str(levels.trail_distance)
         if levels.reasons:
             self._signal(now, candle_open, ENTRY, IGNORED, levels.reasons, details=details)
             return
@@ -424,14 +486,17 @@ class _Sim:
             return
         try:
             rules_orders.check_new(STOP, Side.SELL, pair, levels.stop, quote)
-            if levels.target <= levels.stop:
-                raise OrderRejected("objectif sous le stop")
-            rules_orders.check_new(TARGET, Side.SELL, pair, levels.target, quote)
+            if levels.target is not None:
+                if levels.target <= levels.stop:
+                    raise OrderRejected("objectif sous le stop")
+                rules_orders.check_new(TARGET, Side.SELL, pair, levels.target, quote)
             order = self._record(self.pf.buy(quote, amount, now))
         except OrderRejected as exc:
             self._signal(now, candle_open, ENTRY, IGNORED, (IMPOSSIBLE,), details={**details, "message": str(exc)})
             return
         self.protection = (levels.stop, levels.target)
+        if self.s.trailing and levels.trail_distance is not None:
+            self.trail = (levels.trail_distance, levels.stop + levels.trail_distance)
         self.entered_at = now
         day = session_date(now)
         self.day_entries[day] = self.day_entries.get(day, 0) + 1
@@ -441,11 +506,12 @@ class _Sim:
     # --- Boucle ---
 
     def run(self, start: datetime, end: datetime) -> BacktestResult:
-        t = bucket_start(start, 60)
+        base = self.m.base_step
+        t = bucket_start(start, int(base.total_seconds()))
         if t < start:
-            t += MINUTE
-        per_bar = int(self.m.step // MINUTE)
-        index = int((t - bucket_start(t, int(self.m.step.total_seconds()))) // MINUTE)
+            t += base
+        per_bar = int(self.m.step // base)
+        index = int((t - bucket_start(t, int(self.m.step.total_seconds()))) // base)
         while t < end:
             c = self.m.by_minute.get(t)
             if c is not None and self.in_position:
@@ -456,12 +522,12 @@ class _Sim:
                 self._inside(c, t)
                 if self.in_position:
                     self._halt_check(session_date(t), c.low)
-            t += MINUTE
+            t += base
             index += 1
         links = trades_mod.links_from_signals(self.signals)
         trades = trades_mod.trades_from_orders(self.orders, links)
         marks = {self.s.paire: self.m.candles(start - timedelta(days=1), end)}
-        curve = stats_mod.equity_curve(self.c.capital, self.orders, marks, start, end, self.c.spread_pct)
+        curve = stats_mod.equity_curve(self.c.capital, self.orders, marks, start, end, self.c.spread_pct, base)
         stats = stats_mod.compute(trades, curve, self.c.capital, self.pf.fees_paid)
         return BacktestResult(
             self.s.nom, self.s.paire, self.s.intervalle, start, end, self.c, self.orders, self.signals,
@@ -488,6 +554,13 @@ def run(
         raise InvalidInput(
             f"Backtest : données {market.pair} {market.interval} pour une stratégie {strategy.paire} {strategy.intervalle}."
         )
+    if strategy.swing != (market.base == "1h"):
+        raise InvalidInput(
+            f"Backtest : une stratégie {strategy.horizon} se rejoue sur des klines "
+            f"{'1h' if strategy.swing else '1m'}, pas {market.base}."
+        )
+    if strategy.swing and not config.limits.swing:
+        config = replace(config, limits=SWING_LIMITS)  # garde-fou swing par défaut (perte 7 jours, exposition)
     if start >= end:
         raise InvalidInput("Backtest : la période est vide.")
     return _Sim(strategy, market, config, entries, cache).run(start, end)

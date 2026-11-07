@@ -31,6 +31,8 @@ from simtrade.models import HORIZONS, INTRADAY, PAIRS, SWING
 from simtrade.sessions import SessionRules, entry_allowed, parse_hhmm
 
 MODELS_DIR = Path(__file__).parent / "modeles"
+# Modèles d'essai (tests, essais réels) : trouvés par model(), jamais listés par models() ni mis au catalogue.
+TRIALS_DIR = MODELS_DIR / "essais"
 INTERVALS = ("5m", "15m", "1h")
 TICK = Decimal("0.01")  # pas de prix des trois paires
 HUNDRED = Decimal(100)
@@ -112,6 +114,7 @@ BRICKS: dict[str, dict[str, Param]] = {
     "retour_vwap": {},
     "retour_dans_range": {},
     "duree_max": {"bougies": _int(1, 96, 12)},
+    "cassure_donchian": {"n": _int(5, 100, 20)},  # swing seulement
 }
 ENTRY_BRICKS = ("rsi_extreme", "croisement_ema", "ecart_vwap", "au_dessus_vwap", "cassure_range", "volatilite",
                 "au_dessus_ema", "hauteur_range")
@@ -138,7 +141,9 @@ TOP: dict[str, Param] = {"paire": _choice(*PAIRS), "intervalle": _choice(*INTERV
 
 # --- Swing (étape 7c) : positions de plusieurs jours, sans heures actives ni clôture de session ---
 SWING_INTERVALS = ("1h", "4h", "1d")
-SWING_ENTRY_BRICKS = ("rsi_extreme", "croisement_ema", "volatilite", "au_dessus_ema")
+# Fenêtre du swing (live et backtest) : bougies closes de l'intervalle vues à chaque décision, agrégées des 1h.
+SWING_BARS = {"1h": 499, "4h": 499, "1d": 300}
+SWING_ENTRY_BRICKS = ("rsi_extreme", "croisement_ema", "volatilite", "au_dessus_ema", "cassure_donchian")
 SWING_EXIT_BRICKS = ("rsi_extreme", "croisement_ema", "duree_max")
 SWING_STOPS: dict[str, dict[str, Param]] = {
     "pct": {"valeur": _dec("1", "25", "8")},
@@ -417,6 +422,9 @@ def models() -> dict[str, dict]:
 
 def model(name: str) -> dict:
     found = models()
+    trial = TRIALS_DIR / f"{name}.json"
+    if name not in found and trial.is_file():
+        return json.loads(trial.read_text(encoding="utf-8"))
     if name not in found:
         raise InvalidInput(f"Modèle de stratégie inconnu : '{name}' (modèles : {', '.join(found)}).")
     return found[name]

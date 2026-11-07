@@ -41,7 +41,7 @@ Architecture :
 | 6 | Briques et stratégies intraday (exécution rapide) | ✅ |
 | 7 | Journal, statistiques et backtest → catalogue | ✅ |
 | 7b | Stratégies à faible fréquence → catalogue | ✅ |
-| 7c | Simulateur swing (positions multi-jours, stop suiveur, taille au risque, données longues) | ⬜ |
+| 7c | Simulateur swing (positions multi-jours, stop suiveur, taille au risque, données longues) | ✅ |
 | 7d | Modèles swing et validation glissante → catalogue | ⬜ |
 | 7e | Test en avant du catalogue swing (2–3 mois en papier) | ⬜ |
 | 8 | Équipe d'agents IA (choix du régime et de la stratégie) | ⬜ |

@@ -215,6 +215,17 @@ def au_dessus_ema(view: MarketView, p: dict) -> BrickResult:
     return BrickResult(candles[-1].close > value, {"ema": value})
 
 
+def cassure_donchian(view: MarketView, p: dict) -> BrickResult:
+    """Vrai si la dernière clôture dépasse le plus haut des `n` bougies closes qui la précèdent (canal de
+    Donchian, sans la bougie de la décision)."""
+    candles = closed(view.candles, view.now)
+    n = p["n"]
+    if len(candles) < n + 1:
+        return BrickResult(None, {"donchian_haut": None})
+    high = max(c.high for c in candles[-n - 1 : -1])
+    return BrickResult(candles[-1].close > high, {"donchian_haut": high})
+
+
 def hauteur_range(view: MarketView, p: dict) -> BrickResult:
     """Vrai si la hauteur du range d'ouverture ((haut − bas) / haut) atteint `min_pct` %.
     Les paramètres du range (debut, minutes) viennent de la brique cassure_range."""

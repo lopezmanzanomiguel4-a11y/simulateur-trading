@@ -114,6 +114,8 @@ class PriceHub:
         # Appelé (depuis la boucle) avec les klines 1m clôturées reçues : l'API le branche sur le thread SQLite
         # (enregistrement dans marche.db) ; il ne doit rien faire de bloquant.
         self.on_definitive: Callable[[list[Candle]], object] | None = None
+        # Idem pour les klines 1h clôturées (historique du swing dans marche.db, table klines_1h).
+        self.on_definitive_1h: Callable[[list[Candle]], object] | None = None
         # Débit et coût du traitement des cotations (exposés dans /info.flux)
         self.update_max = 0.0  # secondes, durée max de update() (cache, abonnés, écouteurs)
         self.rate_max = 0  # cotations reçues dans la seconde la plus chargée
@@ -359,16 +361,17 @@ class PriceHub:
             series.mark_checked(now, RECONCILE_GRACE)
 
     def _definitive(self, interval: str, candles: list[Candle]) -> None:
-        if interval != "1m" or self.on_definitive is None:
+        callback = self.on_definitive if interval == "1m" else self.on_definitive_1h if interval == "1h" else None
+        if callback is None:
             return
         now = self.clock()
         final = [c for c in candles if c.is_closed(now)]
         if not final:
             return
         try:
-            self.on_definitive(final)
+            callback(final)
         except Exception:
-            log.exception("Enregistrement des bougies 1m impossible.")
+            log.exception("Enregistrement des bougies %s impossible.", interval)
 
     def history_overall(self) -> str:
         states = set(self.history_state.values())

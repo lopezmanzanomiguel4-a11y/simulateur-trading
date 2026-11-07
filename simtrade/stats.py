@@ -55,11 +55,14 @@ def equity_curve(
     start: datetime,
     end: datetime,
     spread_pct: Decimal = DEFAULT_SPREAD_PCT,
+    step: timedelta = MINUTE,
 ) -> Curve:
-    """Valeur à la fin de chaque minute de [start, end). `marks` : bougies 1m triées par paire.
-    Les ordres antérieurs à `start` sont appliqués d'emblée."""
-    start = bucket_start(start, 60)
-    end = end if bucket_start(end, 60) == end else bucket_start(end, 60) + MINUTE  # minute entamée incluse
+    """Valeur à la fin de chaque minute (ou de chaque `step`, 1 h pour le swing) de [start, end).
+    `marks` : bougies triées par paire, de la même durée que `step`. Les ordres antérieurs à `start`
+    sont appliqués d'emblée."""
+    sec = int(step.total_seconds())
+    start = bucket_start(start, sec)
+    end = end if bucket_start(end, sec) == end else bucket_start(end, sec) + step  # pas entamé inclus
     orders = sorted(orders, key=lambda o: (o.created_at, o.id or 0))
     by_pair = {p: {c.open_time: c.close for c in cs} for p, cs in marks.items()}
     last_price: dict[str, Decimal] = {}
@@ -74,7 +77,7 @@ def equity_curve(
     missing = 0
     t = start
     while t < end:
-        stop = t + MINUTE
+        stop = t + step
         while i < len(orders) and orders[i].created_at < stop:
             o = orders[i]
             cash += o.cash_flow

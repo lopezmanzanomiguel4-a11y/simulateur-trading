@@ -925,6 +925,10 @@ class TradingService:
         """Klines 1m définitives reçues en live (appelé dans le thread de la base)."""
         return self.market_store().save(candles, LIVE)
 
+    def swing_history(self, pair: str, start: datetime, end: datetime) -> list[Candle]:
+        """Klines 1h de marche.db dans [start, end) : historique de la fenêtre swing du runner."""
+        return self.market_store().candles(pair, start, end, "1h")
+
     def close_market_store(self) -> None:
         if self._market_store is not None:
             self._market_store.close()

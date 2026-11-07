@@ -25,6 +25,9 @@ IntervalName = Literal["1m", "5m", "15m", "1h"]
 INTERVALS: dict[str, int] = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600}  # secondes
 MAX_CANDLES: dict[str, int] = {"1m": 1440, "5m": 500, "15m": 500, "1h": 500}  # 1440 x 1m = une journée UTC
 LIMIT_MAX = max(MAX_CANDLES.values())
+# Swing : 4h et 1d ne sont pas des séries du hub ; ils sont agrégés depuis les klines 1h (UTC, 1d de 00:00 à 00:00).
+SWING_SECONDS: dict[str, int] = {"4h": 14400, "1d": 86400}
+BAR_SECONDS: dict[str, int] = {**INTERVALS, **SWING_SECONDS}
 VwapAnchor = Literal["jour_utc", "fenetre"]
 VWAP_ANCHORS: tuple[str, ...] = ("jour_utc", "fenetre")
 SESSION = 86400  # le VWAP de session repart de zéro à 00:00 UTC
@@ -63,7 +66,7 @@ class Candle:
 
     @property
     def close_time(self) -> datetime:
-        return self.open_time + timedelta(seconds=INTERVALS[self.interval])
+        return self.open_time + timedelta(seconds=BAR_SECONDS[self.interval])
 
     def is_closed(self, now: datetime) -> bool:
         return now >= self.close_time
@@ -228,11 +231,12 @@ class MarketData:
 
 
 def aggregate(candles_1m: Sequence[Candle], interval: str) -> list[Candle]:
-    """Bougies `interval` agrégées depuis des 1m triées (ouverture de la première, plus haut, plus bas,
-    clôture de la dernière, sommes du volume, du notional et des transactions). Une bougie à laquelle
-    il manque une minute est marquée `complete=False`."""
-    seconds = INTERVALS[interval]
-    expected = seconds // 60
+    """Bougies `interval` agrégées depuis des bougies de base triées, 1m (ou 1h pour 4h et 1d) : ouverture
+    de la première, plus haut, plus bas, clôture de la dernière, sommes du volume, du notional et des
+    transactions. Une bougie à laquelle il manque une bougie de base est marquée `complete=False`."""
+    seconds = BAR_SECONDS[interval]
+    base = BAR_SECONDS[candles_1m[0].interval] if candles_1m else 60
+    expected = seconds // base
     out: list[Candle] = []
     group: list[Candle] = []
 

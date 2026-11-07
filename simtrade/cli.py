@@ -152,15 +152,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--depuis", help="début (AAAA-MM-JJ ou AAAA-MM-JJTHH:MM, UTC)")
     p.add_argument("--jusqu-a", dest="jusqu_a", help="fin (exclue)")
 
-    p = sub.add_parser("marche", help="base des bougies 1m (marche.db) : téléchargement et état")
+    p = sub.add_parser("marche", help="base des bougies 1m et 1h (marche.db) : téléchargement et état")
     actions = p.add_subparsers(dest="action", required=True, metavar="action")
     q = actions.add_parser("telecharger", help="télécharge les klines 1m Binance (reprend là où on s'est arrêté)")
     q.add_argument("--paires", nargs="+", default=list(PAIRS), help="paires (défaut : les trois)")
     q.add_argument("--jours", type=int, default=183, help="nombre de jours jusqu'à aujourd'hui 00:00 UTC (défaut 183)")
     q.add_argument("--depuis", help="début (AAAA-MM-JJ, UTC), remplace --jours")
     q.add_argument("--jusqu-a", dest="jusqu_a", help="fin exclue (défaut : aujourd'hui 00:00 UTC)")
+    q.add_argument("--intervalle", choices=("1m", "1h"), default="1m", help="1m (défaut) ou 1h (swing)")
+    q.add_argument("--swing", action="store_true", help="les 10 paires du swing (remplace --paires)")
     q = actions.add_parser("etat", help="lignes, période, trous et taille de marche.db")
     q.add_argument("--paires", nargs="+", default=list(PAIRS))
+    q.add_argument("--intervalle", choices=("1m", "1h"), default="1m")
+    q.add_argument("--swing", action="store_true", help="les 10 paires du swing (remplace --paires)")
 
     p = sub.add_parser("backtest", help="rejoue un modèle sur les bougies de marche.db (frais et spread compris)")
     p.add_argument("modele", metavar="modèle", help="nom du modèle (voir : strategies)")
@@ -749,21 +753,27 @@ def cmd_marche(service: TradingService, args: argparse.Namespace):
     from datetime import timedelta
 
     from simtrade.download import PairReport, gap_report
-    from simtrade.marche import missing_minutes
+    from simtrade.marche import STORED, missing_steps
+    from simtrade.models import SWING_PAIRS
 
+    if args.swing:
+        args.paires = list(SWING_PAIRS)
+    iv = args.intervalle
+    unit = "min" if iv == "1m" else "h"
     store = service.market_store()
     if args.action == "etat":
         print(f"Base des bougies : {store.path} ({store.size_bytes() / 1e6:.1f} Mo)")
         rows = []
         for pair in args.paires:
-            bounds = store.bounds(pair)
+            bounds = store.bounds(pair, iv)
             if bounds is None:
                 rows.append((pair, "0", "-", "-", "-", "-"))
                 continue
-            r = gap_report(store, PairReport(pair), bounds[0], bounds[1] + timedelta(minutes=1))
-            rows.append((pair, str(store.count(pair)), local(bounds[0]), local(bounds[1]),
-                         f"{len(r.binance)} ({missing_minutes(r.binance)} min)",
-                         f"{len(r.pending)} ({missing_minutes(r.pending)} min)"))
+            r = gap_report(store, PairReport(pair, interval=iv), bounds[0],
+                           bounds[1] + timedelta(milliseconds=STORED[iv]))
+            rows.append((pair, str(store.count(pair, interval=iv)), local(bounds[0]), local(bounds[1]),
+                         f"{len(r.binance)} ({missing_steps(r.binance, iv)} {unit})",
+                         f"{len(r.pending)} ({missing_steps(r.pending, iv)} {unit})"))
         print(table(["Paire", "Lignes", "Première", "Dernière", "Trous Binance", "À télécharger"], rows, left=1))
         return 0
     return _download(store, args)
@@ -773,7 +783,7 @@ async def _download(store, args: argparse.Namespace) -> int:
     from datetime import timedelta
 
     from simtrade.download import Downloader
-    from simtrade.marche import missing_minutes
+    from simtrade.marche import missing_steps
     from simtrade.history import BinanceHistory
     from simtrade.models import utcnow
     from simtrade.stats import parse_utc
@@ -784,14 +794,15 @@ async def _download(store, args: argparse.Namespace) -> int:
     history = BinanceHistory()
     started = time.perf_counter()
     try:
-        downloader = Downloader(store, history, progress=lambda m: print("  " + m, flush=True))
+        downloader = Downloader(store, history, progress=lambda m: print("  " + m, flush=True), interval=args.intervalle)
         report = await downloader.download(args.paires, start, end)
     finally:
         await history.aclose()
     elapsed = time.perf_counter() - started
     print(f"Période : {start:%Y-%m-%d %H:%M} → {end:%Y-%m-%d %H:%M} UTC, durée {elapsed:.0f} s")
-    rows = [(p.pair, str(p.rows), str(p.requests), f"{len(p.binance)} ({missing_minutes(p.binance)} min)",
-             f"{len(p.pending)} ({missing_minutes(p.pending)} min)") for p in report.pairs]
+    unit = "min" if args.intervalle == "1m" else "h"
+    rows = [(p.pair, str(p.rows), str(p.requests), f"{len(p.binance)} ({missing_steps(p.binance, p.interval)} {unit})",
+             f"{len(p.pending)} ({missing_steps(p.pending, p.interval)} {unit})") for p in report.pairs]
     print(table(["Paire", "Lignes écrites", "Requêtes", "Trous Binance", "À télécharger"], rows, left=1))
     for p in report.pairs:
         for kind, ranges in (("Binance", p.binance), ("à télécharger", p.pending)):
@@ -841,13 +852,23 @@ def cmd_backtest(service: TradingService, args: argparse.Namespace) -> int:
     spread = parse_decimal(args.spread, "Spread")
     if not Decimal(0) <= spread <= Decimal(5):
         raise InvalidInput(f"Spread invalide : {args.spread} (de 0 à 5 %).")
-    candles = service.market_store().candles(strategy.paire, start - timedelta(days=2), end)
+    if strategy.swing:  # klines 1h, avec la fenêtre swing avant le début (SWING_BARS bougies + 1)
+        from simtrade.market import BAR_SECONDS
+
+        warmup = timedelta(seconds=BAR_SECONDS[strategy.intervalle]) * (strategies.SWING_BARS[strategy.intervalle] + 1)
+        candles = service.market_store().candles(strategy.paire, start - warmup, end, "1h")
+    else:
+        candles = service.market_store().candles(strategy.paire, start - timedelta(days=2), end)
     if not candles:
+        hint = " --intervalle 1h --swing" if strategy.swing else ""
         raise InvalidInput(
-            f"Aucune bougie {strategy.paire} dans marche.db pour cette période : python -m simtrade marche telecharger."
+            f"Aucune bougie {strategy.paire} dans marche.db pour cette période : "
+            f"python -m simtrade marche telecharger{hint}."
         )
     started = time.perf_counter()
     r = backtest.run(strategy, candles, start, end, backtest.BacktestConfig(spread_pct=spread))
+    if strategy.swing:
+        print("Swing : klines 1h, sans clôture de session, garde-fou swing (perte 7 jours, exposition).")
     print(f"Backtest {strategy.nom} sur {strategy.paire} {strategy.intervalle}, {start:%Y-%m-%d %H:%M} → "
           f"{end:%Y-%m-%d %H:%M} UTC, spread {fmt.num(spread)} %, frais {fmt.num(FEE_RATE * 100, 1)} % "
           f"({time.perf_counter() - started:.1f} s)")

@@ -1,0 +1,12 @@
+{
+  "nom": "essai-donchian",
+  "horizon": "swing",
+  "paire": "BTCUSDT",
+  "intervalle": "1d",
+  "entree": [
+    {"brique": "cassure_donchian", "n": 20}
+  ],
+  "stop": {"type": "suiveur_atr", "multiple": "3", "n": 14},
+  "objectif": {"type": "aucun"},
+  "taille": {"risque_pct": "1"}
+}

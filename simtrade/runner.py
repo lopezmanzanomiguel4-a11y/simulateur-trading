@@ -10,6 +10,10 @@ Chaque seconde, pour chaque stratégie active :
 
 Après un redémarrage, seule une bougie clôturée depuis moins d'un intervalle est évaluée, et la base
 refuse une seconde décision sur la même bougie : un signal ne produit jamais deux ordres.
+
+Swing : la fenêtre (SWING_BARS bougies de 1h, 4h ou 1d) vient des klines 1h de marche.db complétées par la
+série 1h du hub (qui fait foi sur les heures récentes), agrégées comme au backtest. La bougie est définitive
+quand toutes ses heures sont des klines Binance. Pas de série 1m dans la vue.
 """
 
 from __future__ import annotations
@@ -25,7 +29,7 @@ from typing import Any
 
 from simtrade import bricks, strategies
 from simtrade.hub import PriceHub
-from simtrade.market import INTERVALS, ORIGIN_REST, Candle, session_start
+from simtrade.market import BAR_SECONDS, INTERVALS, ORIGIN_REST, Candle, aggregate, bucket_start, session_start
 from simtrade.models import PAIRS
 from simtrade.service import ENTRY, EXIT, TradingService
 from simtrade.storage import ActivationRecord
@@ -121,6 +125,9 @@ class StrategyRunner:
         if state is None or state.strategy != strategy.nom:
             state = self.states[activation.account_id] = RunnerState(strategy.nom)
         now = self.clock()
+        if strategy.swing:
+            await self._step_swing(activation, strategy, state, now)
+            return
         candles = bricks.closed(self.hub.market.candles(strategy.paire, strategy.intervalle), now)
         if not candles:
             state.reasons = ("pas_de_bougie",)
@@ -142,6 +149,54 @@ class StrategyRunner:
         if self._attempts[key] >= MAX_ATTEMPTS:
             self._done[activation.id] = last.open_time  # dernier essai : la bougie ne sera plus reprise
         view = bricks.MarketView(last.close_time, candles, candles_1m)
+        data_reasons = self._quality_reasons(strategy, now, candles_1m)
+        await self._decide(activation, strategy, state, now, last, view, final, data_reasons, key)
+
+    async def _step_swing(self, activation: ActivationRecord, strategy: Strategy, state: RunnerState, now: datetime) -> None:
+        step = timedelta(seconds=BAR_SECONDS[strategy.intervalle])
+        last_open = bucket_start(now, int(step.total_seconds())) - step
+        if self._done.get(activation.id) == last_open:
+            return  # bougie déjà traitée : pas de lecture de marche.db à chaque seconde
+        candles = await self.swing_candles(strategy, now)
+        if not candles:
+            state.reasons = ("pas_de_bougie",)
+            return
+        last = candles[-1]
+        if self._done.get(activation.id) == last.open_time:
+            return
+        if now - last.close_time >= step:
+            self._done[activation.id] = last.open_time
+            return
+        final = last.origin == ORIGIN_REST and last.complete
+        if not final and now - last.close_time < self.max_wait:
+            return  # on attend les klines 1h
+        key = (activation.id, last.open_time)
+        self._attempts[key] = self._attempts.get(key, 0) + 1
+        if self._attempts[key] >= MAX_ATTEMPTS:
+            self._done[activation.id] = last.open_time
+        view = bricks.MarketView(last.close_time, candles, [])
+        today = [c for c in bricks.closed(self.hub.market.candles(strategy.paire, "1h"), now)
+                 if c.open_time >= session_start(now)]
+        volume = sum((c.volume for c in today), Decimal(0))
+        data_reasons = strategies.quality_blockers(strategy, [self.hub.quality(strategy.paire, "1h", volume)])
+        await self._decide(activation, strategy, state, now, last, view, final, data_reasons, key)
+
+    async def swing_candles(self, strategy: Strategy, now: datetime) -> list[Candle]:
+        """Bougies closes de l'intervalle swing : klines 1h de marche.db + série 1h du hub, agrégées."""
+        interval = strategy.intervalle
+        span = timedelta(seconds=BAR_SECONDS[interval]) * (strategies.SWING_BARS[interval] + 1)
+        end = bucket_start(now, 3600)
+        stored = await self.service.run(self.service.swing_history, strategy.paire, end - span, end)
+        hours = {c.open_time: c for c in stored}
+        hours.update({c.open_time: c for c in bricks.closed(self.hub.market.candles(strategy.paire, "1h"), now)})
+        ordered = [hours[t] for t in sorted(hours)]
+        bars = ordered if interval == "1h" else aggregate(ordered, interval)
+        return bricks.closed(bars, now)[-strategies.SWING_BARS[interval]:]
+
+    async def _decide(
+        self, activation: ActivationRecord, strategy: Strategy, state: RunnerState, now: datetime, last: Candle,
+        view: bricks.MarketView, final: bool, data_reasons: tuple[str, ...], key: tuple[int, datetime],
+    ) -> None:
         context = await self.service.run(self.service.strategy_context, activation.account_id, strategy.paire)
         started = time.perf_counter()
         evaluation = strategies.evaluate(strategy, view, context.entered_at if context.has_position else None)
@@ -152,7 +207,6 @@ class StrategyRunner:
         state.entry, state.exit, state.values = evaluation.entry, evaluation.exit, jsonable(evaluation.values)
         state.reasons, state.decision = (), None
 
-        data_reasons = self._quality_reasons(strategy, now, candles_1m)
         if not final:
             data_reasons = (strategies.NOT_DEFINITIVE, *data_reasons)
         if context.has_position and evaluation.exit:

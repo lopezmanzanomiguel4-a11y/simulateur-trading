@@ -450,6 +450,7 @@ def create_app(service: ServiceFactory | None = None, hub: PriceHub | None = Non
             future.add_done_callback(_log_failure)
 
         price_hub.on_definitive = record_candles
+        price_hub.on_definitive_1h = record_candles  # klines 1h : historique du swing (klines_1h)
         watcher = OrderWatcher(svc)
         await svc.run(watcher.load)  # ordres en attente enregistrés avant l'arrêt
         price_hub.listeners.append(watcher.on_quote)

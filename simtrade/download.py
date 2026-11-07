@@ -1,4 +1,7 @@
-"""Téléchargement de klines 1m Binance vers `marche.db` (CLI : python -m simtrade marche telecharger).
+"""Téléchargement de klines 1m ou 1h Binance vers `marche.db` (CLI : python -m simtrade marche telecharger).
+
+`Downloader(interval="1h")` : klines 1h du swing (depuis 2019 ; avant la cotation d'une paire, Binance
+renvoie une page vide, mémorisée comme plage vide : pas redemandée à la reprise).
 
 - pages de 1000 minutes (`BinanceHistory.page`), enregistrées une à une : un arrêt en cours de route
   ne perd que la page en cours, et la commande suivante reprend là où on s'est arrêté ;
@@ -20,7 +23,7 @@ from pathlib import Path
 from simtrade.errors import SimTradeError
 from simtrade.history import BinanceHistory, RateLimited
 from simtrade.market import bucket_start
-from simtrade.marche import DOWNLOAD, MINUTE, MarketStore, intersect_ranges, missing_minutes, subtract_ranges
+from simtrade.marche import DOWNLOAD, STORED, MarketStore, intersect_ranges, missing_steps, subtract_ranges
 from simtrade.models import utcnow
 
 MIN_FREE_BYTES = 5 * 1024**3  # 5 Go libres en permanence
@@ -43,15 +46,16 @@ class PairReport:
     gaps: list[tuple[datetime, datetime]] = field(default_factory=list)  # toutes les minutes absentes de la base
     binance: list[tuple[datetime, datetime]] = field(default_factory=list)  # dont : renvoyées vides par Binance
     pending: list[tuple[datetime, datetime]] = field(default_factory=list)  # dont : encore à télécharger
+    interval: str = "1m"
 
     @property
     def missing(self) -> int:
-        return missing_minutes(self.gaps)
+        return missing_steps(self.gaps, self.interval)
 
 
 def gap_report(store: MarketStore, pr: PairReport, start: datetime, end: datetime) -> PairReport:
-    pr.gaps = store.gaps(pr.pair, start, end)
-    pr.binance = intersect_ranges(store.binance_empty(pr.pair), start, end)
+    pr.gaps = store.gaps(pr.pair, start, end, pr.interval)
+    pr.binance = intersect_ranges(store.binance_empty(pr.pair, pr.interval), start, end)
     pr.pending = subtract_ranges(pr.gaps, pr.binance)
     return pr
 
@@ -66,17 +70,20 @@ class DownloadReport:
     free_bytes_after: int = 0
 
 
-def segments(store: MarketStore, pair: str, start: datetime, end: datetime) -> list[tuple[datetime, datetime]]:
+def segments(
+    store: MarketStore, pair: str, start: datetime, end: datetime, interval: str = "1m"
+) -> list[tuple[datetime, datetime]]:
     """Ce qui reste à télécharger dans [start, end) : tous les trous (avant, entre et après les minutes
     enregistrées, par exemple entre un téléchargement et des bougies live), sauf les plages déjà demandées
     et renvoyées vides par Binance."""
     if start >= end:
         return []
-    return subtract_ranges(store.gaps(pair, start, end), store.binance_empty(pair))
+    return subtract_ranges(store.gaps(pair, start, end, interval), store.binance_empty(pair, interval))
 
 
-def estimate_rows(store: MarketStore, pairs: Sequence[str], start: datetime, end: datetime) -> int:
-    return sum((b - a) // MINUTE for pair in pairs for a, b in segments(store, pair, start, end))
+def estimate_rows(store: MarketStore, pairs: Sequence[str], start: datetime, end: datetime, interval: str = "1m") -> int:
+    step = timedelta(milliseconds=STORED[interval])
+    return sum((b - a) // step for pair in pairs for a, b in segments(store, pair, start, end, interval))
 
 
 class Downloader:
@@ -90,7 +97,12 @@ class Downloader:
         clock: Callable[[], datetime] = utcnow,
         min_free: int = MIN_FREE_BYTES,
         progress: Callable[[str], None] | None = None,
+        interval: str = "1m",
     ):
+        if interval not in STORED:
+            raise ValueError(f"intervalle non stocké : {interval}")
+        self.interval = interval
+        self.step = timedelta(milliseconds=STORED[interval])
         self.store = store
         self.history = history
         self._sleep = sleep
@@ -105,7 +117,7 @@ class Downloader:
 
     def check_disk(self, pairs: Sequence[str], start: datetime, end: datetime) -> int:
         """Lève DiskFull si l'espace libre estimé après téléchargement < min_free ; renvoie l'estimation (octets)."""
-        needed = estimate_rows(self.store, pairs, start, end) * BYTES_PER_ROW
+        needed = estimate_rows(self.store, pairs, start, end, self.interval) * BYTES_PER_ROW
         free = self._free()
         if free - needed < self.min_free:
             raise DiskFull(
@@ -116,7 +128,7 @@ class Downloader:
 
     def _empty(self, pair: str, a: datetime, b: datetime, current: datetime) -> None:
         """Mémorise une plage demandée et renvoyée vide (hors minutes trop récentes)."""
-        self.store.add_binance_empty(pair, a, min(b, current - RECENT))
+        self.store.add_binance_empty(pair, a, min(b, current - RECENT), self.interval)
 
     async def _wait(self, seconds: float, report: DownloadReport, why: str) -> None:
         report.waits.append(seconds)
@@ -128,7 +140,7 @@ class Downloader:
         for attempt in range(MAX_RETRIES + 1):
             try:
                 pr.requests += 1
-                page = await self.history.page(pair, "1m", a, b)
+                page = await self.history.page(pair, self.interval, a, b)
             except RateLimited as exc:
                 if attempt == MAX_RETRIES:
                     raise
@@ -142,14 +154,14 @@ class Downloader:
         raise AssertionError("inaccessible")
 
     async def download(self, pairs: Sequence[str], start: datetime, end: datetime | None = None) -> DownloadReport:
-        current = bucket_start(self.clock(), 60)
-        end = min(end or current, current)  # minutes clôturées seulement
+        current = bucket_start(self.clock(), int(self.step.total_seconds()))
+        end = min(end or current, current)  # bougies clôturées seulement
         self.check_disk(pairs, start, end)
         report = DownloadReport(start, end, [])
         for pair in pairs:
-            pr = PairReport(pair)
+            pr = PairReport(pair, interval=self.interval)
             report.pairs.append(pr)
-            for a, b in segments(self.store, pair, start, end):
+            for a, b in segments(self.store, pair, start, end, self.interval):
                 cursor = a
                 while cursor < b:
                     raw = await self._page(pair, cursor, b, report, pr)
@@ -159,9 +171,9 @@ class Downloader:
                         for c in page:
                             if c.open_time > expected:
                                 self._empty(pair, expected, c.open_time, current)
-                            expected = c.open_time + MINUTE
+                            expected = c.open_time + self.step
                         pr.rows += self.store.save(page, DOWNLOAD)
-                        cursor = page[-1].open_time + MINUTE
+                        cursor = page[-1].open_time + self.step
                         if self.progress:
                             self.progress(f"{pair} : jusqu'à {cursor:%Y-%m-%d %H:%M} UTC ({pr.rows} lignes)")
                     if len(raw) < self.history.page_size:
