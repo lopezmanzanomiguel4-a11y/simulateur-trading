@@ -4,7 +4,7 @@
   "intervalle": "15m",
   "entree": [
     {"brique": "au_dessus_ema", "n": 200},
-    {"brique": "rsi_extreme", "zone": "bas", "n": 14, "seuil": 30},
+    {"brique": "rsi_extreme", "zone": "bas", "n": 14, "seuil": 40},
     {"brique": "volatilite", "n": 14, "min_pct": "0.25", "max_pct": "2"}
   ],
   "sortie": [

@@ -264,7 +264,7 @@ $$d_o \ge 2f \times 100 + \text{spread}_\% + 0{,}10 = 0{,}30 + \text{spread}_\% 
 
 | | `tendance-1h` (1h) | `cassure-matin` (15m) | `repli-tendance` (15m) |
 |---|---|---|---|
-| Entrée | `croisement_ema` haussier 9/21 ET `volatilite` 0,5–3 % | `cassure_range` (00:00, 480 min) ET `hauteur_range` ≥ 1,5 % | `au_dessus_ema` 200 ET `rsi_extreme` bas 30 ET `volatilite` 0,25–2 % |
+| Entrée | `croisement_ema` haussier 9/21 ET `volatilite` 0,5–3 % | `cassure_range` (00:00, 480 min) ET `hauteur_range` ≥ 1,5 % | `au_dessus_ema` 200 ET `rsi_extreme` bas 40 ET `volatilite` 0,25–2 % |
 | Stop | 1,5 × ATR14 | bas du range − 0,05 % | 2 × ATR14 |
 | Objectif | 3 × ATR14 | 1,5 R | 1,5 % |
 | Sortie sur signal | `croisement_ema` baissier 9/21 | `retour_dans_range` | `rsi_extreme` haut 70 OU `duree_max` 32 |

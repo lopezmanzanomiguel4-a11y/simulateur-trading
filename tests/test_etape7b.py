@@ -94,10 +94,10 @@ def test_grille_7b_valide_et_defauts():
 
 
 def test_repli_tendance_surcharge_seulement_le_rsi_d_entree():
-    s = catalogue.strategy_for("repli-tendance", "BTCUSDT", {"entree.rsi_extreme.seuil": "25", "objectif.valeur": "2"})
-    assert next(b for b in s.entree if b.name == "rsi_extreme").params["seuil"] == D("25")
+    s = catalogue.strategy_for("repli-tendance", "BTCUSDT", {"entree.rsi_extreme.seuil": "35", "objectif.valeur": "2"})
+    assert next(b for b in s.entree if b.name == "rsi_extreme").params["seuil"] == D("35")
     assert next(b for b in s.sortie if b.name == "rsi_extreme").params["seuil"] == D("70")
-    assert catalogue._current(s, "entree.rsi_extreme.seuil") == D("25")
+    assert catalogue._current(s, "entree.rsi_extreme.seuil") == D("35")
 
 
 def test_objectif_d_au_moins_un_pourcent():

@@ -56,7 +56,7 @@ GRID: dict[str, tuple[tuple[str, tuple[Any, ...]], tuple[str, tuple[Any, ...]]]]
 GRID_7B: dict[str, tuple[tuple[str, tuple[Any, ...]], tuple[str, tuple[Any, ...]]]] = {
     "tendance-1h": (("objectif.multiple", ("2", "3", "4")), ("croisement_ema.lente", (21, 30, 50))),
     "cassure-matin": (("hauteur_range.min_pct", ("1", "1.5", "2")), ("objectif.multiple", ("1", "1.5", "2"))),
-    "repli-tendance": (("entree.rsi_extreme.seuil", ("25", "30", "35")), ("objectif.valeur", ("1", "1.5", "2"))),
+    "repli-tendance": (("entree.rsi_extreme.seuil", ("35", "40", "45")), ("objectif.valeur", ("1", "1.5", "2"))),
 }
 GRIDS = {**GRID, **GRID_7B}
 

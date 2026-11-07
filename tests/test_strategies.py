@@ -23,7 +23,7 @@ def model(name, **changes):
 # --- Modèles ---
 
 
-def test_les_trois_modeles_sont_valides_et_relus_a_l_identique():
+def test_les_six_modeles_sont_valides_et_relus_a_l_identique():
     found = strategies.models()
     assert sorted(found) == ["cassure-matin", "cassure-range", "repli-tendance", "retour-vwap", "tendance-1h",
                              "tendance-ema"]
