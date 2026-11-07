@@ -37,7 +37,7 @@ Architecture :
 | 4 | Ordres avancés, sessions intraday et comptes multiples | ✅ |
 | 5 | Garde-fou de risque | ✅ |
 | 6 | Briques et stratégies intraday (exécution rapide) | ✅ |
-| 7 | Journal, statistiques et backtest → catalogue | ⬜ |
+| 7 | Journal, statistiques et backtest → catalogue | ✅ |
 | 8 | Équipe d'agents IA (choix du régime et de la stratégie) | ⬜ |
 | 9 | Interface | ⬜ |
 | 10 | Comparaison : agents vs références | ⬜ |

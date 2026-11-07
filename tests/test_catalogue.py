@@ -229,3 +229,58 @@ def test_calcul_en_processus_spawn(tmp_path):
     catalogue.out_of_sample_phase({("retour-vwap", "BTCUSDT"): serial}, loader, PERIODS, LOOSE, tuple(range(1, 5)),
                                   None, lambda m: None)
     assert c.draws == serial.draws and c.oos["stats"] == serial.oos["stats"]  # mêmes résultats qu'en série
+
+
+# --- Présentation des rapports ---
+
+
+def fake_build(couples, seconds):
+    return catalogue.Build(PERIODS, BacktestConfig(), couples, tuple(range(1, 11)), "abc1234",
+                           datetime(2026, 11, 7, 17, 59, tzinfo=catalogue.UTC), seconds)
+
+
+def _couple_teste():
+    c = selected_couple()
+    c.draws = [D(-10)] * 10
+    c.oos = {"stats": stats(50, 40), "sensitivity": stats(-3, 40), "open_close": stats(1, 4), "nothing": stats(0, 0),
+             "p": 0.01, "entries": 40, "eligible": 4000, "ignored": {}, "thresholds": regimes.Thresholds(D("0.19"), D("0.26")),
+             "is_regimes": {}, "oos_regimes": {}}
+    c.status = catalogue.ADMITTED
+    return c
+
+
+def test_rapports_nombres_a_la_francaise():
+    b = fake_build([_couple_teste()], {"echantillon": 3072.0, "hors_echantillon": 600.0})
+    report = catalogue.report_md(b.couples[0], b)
+    summary = catalogue.summary_md(b)
+    for text in (report, summary):
+        assert "spread 0,02 %" in text.lower() and "frais 0,1 % par ordre" in text and "10 000,00 USDT" in text
+        assert "0.02" not in text and "0.100" not in text
+    assert "| **0,4** |" in report and "+100,00 (40)*" in report and "ATR 14 ≥ 0,1900 %" in report
+    assert "+50,00" in report and "percentile 100" in report and "s = 0,05 %" in report
+
+
+def test_durees_lisibles():
+    none_tested = fake_build([Couple("retour-vwap", "BTCUSDT")], {"echantillon": 3072.0, "hors_echantillon": 0.004})
+    assert catalogue.durations(none_tested) == "échantillon 51,2 min, hors échantillon non lancé (aucune candidate)"
+    tested = fake_build([_couple_teste()], {"echantillon": 45.0, "hors_echantillon": 600.0})
+    assert catalogue.durations(tested) == "échantillon 45 s, hors échantillon 10,0 min"
+    assert "0,0 min" not in catalogue.summary_md(none_tested) and "0.0 min" not in catalogue.summary_md(none_tested)
+
+
+def test_prudence_sans_couple_teste():
+    b = fake_build([Couple("retour-vwap", "BTCUSDT")], {"echantillon": 10.0})
+    text = catalogue.prudence(b)
+    assert "aucun couple n'a été testé hors échantillon" in text and "0,0 couple" not in text and "0.0" not in text
+    assert "Si les 9 couples l'avaient été" in text
+    tested = catalogue.prudence(fake_build([_couple_teste()], {"echantillon": 10.0}))
+    assert "1 couple(s) testé(s)" in tested and "environ 0,1 couple(s)" in tested
+
+
+def test_grille_echantillon_dans_le_catalogue(tmp_path):
+    c = Couple("retour-vwap", "BTCUSDT", cells=grid(["+-f", "---", "---"]))
+    data = catalogue.catalogue_json(fake_build([c], {"echantillon": 1.0}))
+    rows = data["resultats"][0]["grille_echantillon"]
+    assert len(rows) == 9 and rows[0] == {"parametres": {"ecart_vwap.seuil_pct": "0.4", "rsi_extreme.seuil": "25"},
+                                           "pnl": "100.00", "trades": 40, "candidate": True}
+    assert rows[2]["candidate"] is False and rows[2]["trades"] == 10

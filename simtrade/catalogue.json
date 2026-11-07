@@ -1,0 +1,204 @@
+{
+  "version": 1,
+  "cree_le": "2026-11-07T17:59:45.742110+00:00",
+  "commit": "ae6a8d9",
+  "periodes": {
+    "donnees": "2026-05-07T00:00:00+00:00",
+    "echantillon": [
+      "2026-05-09T00:00:00+00:00",
+      "2026-09-07T00:00:00+00:00"
+    ],
+    "hors_echantillon": [
+      "2026-09-07T00:00:00+00:00",
+      "2026-11-07T00:00:00+00:00"
+    ]
+  },
+  "intervalle": "5m",
+  "spread_pct": "0.02",
+  "frais_pct": "0.100",
+  "capital": "10000",
+  "grille": {
+    "retour-vwap": {
+      "ecart_vwap.seuil_pct": [
+        "0.4",
+        "0.6",
+        "0.9"
+      ],
+      "rsi_extreme.seuil": [
+        "25",
+        "30",
+        "35"
+      ]
+    },
+    "tendance-ema": {
+      "croisement_ema.rapide": [
+        6,
+        9,
+        12
+      ],
+      "croisement_ema.lente": [
+        21,
+        30,
+        42
+      ]
+    },
+    "cassure-range": {
+      "cassure_range.minutes": [
+        15,
+        30,
+        60
+      ],
+      "objectif.multiple": [
+        "1",
+        "1.5",
+        "2.5"
+      ]
+    }
+  },
+  "criteres": {
+    "candidate_echantillon": {
+      "trades_min": 30,
+      "pnl": "> 0"
+    },
+    "selection": "voisinage : moyenne du P&L de la combinaison et de ses voisines directes",
+    "bornes": "plus grand rectangle de candidates contenant la combinaison choisie",
+    "admission": {
+      "pnl": "> 0",
+      "achat_0h_cloture": "P&L supérieur",
+      "tirages_battus_min_pct": 90.0,
+      "trades_min": 30
+    },
+    "regime_retenu": {
+      "trades_min": 20,
+      "pnl_par_trade": "> 0 en échantillon"
+    },
+    "sensibilite_spread_pct": "0.05"
+  },
+  "tirages": {
+    "n": 100,
+    "graines": [
+      1,
+      100
+    ]
+  },
+  "entrees": [],
+  "resultats": [
+    {
+      "modele": "retour-vwap",
+      "paire": "BTCUSDT",
+      "statut": "rejetee_en_echantillon",
+      "raisons": [
+        "aucune combinaison avec ≥ 30 trades et un P&L > 0 en échantillon"
+      ],
+      "parametres": null,
+      "pnl_hors_echantillon": null,
+      "trades_hors_echantillon": null,
+      "percentile_tirages": null,
+      "rapport": "backtests/retour-vwap-btcusdt.md"
+    },
+    {
+      "modele": "retour-vwap",
+      "paire": "ETHUSDT",
+      "statut": "rejetee_en_echantillon",
+      "raisons": [
+        "aucune combinaison avec ≥ 30 trades et un P&L > 0 en échantillon"
+      ],
+      "parametres": null,
+      "pnl_hors_echantillon": null,
+      "trades_hors_echantillon": null,
+      "percentile_tirages": null,
+      "rapport": "backtests/retour-vwap-ethusdt.md"
+    },
+    {
+      "modele": "retour-vwap",
+      "paire": "SOLUSDT",
+      "statut": "rejetee_en_echantillon",
+      "raisons": [
+        "aucune combinaison avec ≥ 30 trades et un P&L > 0 en échantillon"
+      ],
+      "parametres": null,
+      "pnl_hors_echantillon": null,
+      "trades_hors_echantillon": null,
+      "percentile_tirages": null,
+      "rapport": "backtests/retour-vwap-solusdt.md"
+    },
+    {
+      "modele": "tendance-ema",
+      "paire": "BTCUSDT",
+      "statut": "rejetee_en_echantillon",
+      "raisons": [
+        "aucune combinaison avec ≥ 30 trades et un P&L > 0 en échantillon"
+      ],
+      "parametres": null,
+      "pnl_hors_echantillon": null,
+      "trades_hors_echantillon": null,
+      "percentile_tirages": null,
+      "rapport": "backtests/tendance-ema-btcusdt.md"
+    },
+    {
+      "modele": "tendance-ema",
+      "paire": "ETHUSDT",
+      "statut": "rejetee_en_echantillon",
+      "raisons": [
+        "aucune combinaison avec ≥ 30 trades et un P&L > 0 en échantillon"
+      ],
+      "parametres": null,
+      "pnl_hors_echantillon": null,
+      "trades_hors_echantillon": null,
+      "percentile_tirages": null,
+      "rapport": "backtests/tendance-ema-ethusdt.md"
+    },
+    {
+      "modele": "tendance-ema",
+      "paire": "SOLUSDT",
+      "statut": "rejetee_en_echantillon",
+      "raisons": [
+        "aucune combinaison avec ≥ 30 trades et un P&L > 0 en échantillon"
+      ],
+      "parametres": null,
+      "pnl_hors_echantillon": null,
+      "trades_hors_echantillon": null,
+      "percentile_tirages": null,
+      "rapport": "backtests/tendance-ema-solusdt.md"
+    },
+    {
+      "modele": "cassure-range",
+      "paire": "BTCUSDT",
+      "statut": "rejetee_en_echantillon",
+      "raisons": [
+        "aucune combinaison avec ≥ 30 trades et un P&L > 0 en échantillon"
+      ],
+      "parametres": null,
+      "pnl_hors_echantillon": null,
+      "trades_hors_echantillon": null,
+      "percentile_tirages": null,
+      "rapport": "backtests/cassure-range-btcusdt.md"
+    },
+    {
+      "modele": "cassure-range",
+      "paire": "ETHUSDT",
+      "statut": "rejetee_en_echantillon",
+      "raisons": [
+        "aucune combinaison avec ≥ 30 trades et un P&L > 0 en échantillon"
+      ],
+      "parametres": null,
+      "pnl_hors_echantillon": null,
+      "trades_hors_echantillon": null,
+      "percentile_tirages": null,
+      "rapport": "backtests/cassure-range-ethusdt.md"
+    },
+    {
+      "modele": "cassure-range",
+      "paire": "SOLUSDT",
+      "statut": "rejetee_en_echantillon",
+      "raisons": [
+        "aucune combinaison avec ≥ 30 trades et un P&L > 0 en échantillon"
+      ],
+      "parametres": null,
+      "pnl_hors_echantillon": null,
+      "trades_hors_echantillon": null,
+      "percentile_tirages": null,
+      "rapport": "backtests/cassure-range-solusdt.md"
+    }
+  ]
+}

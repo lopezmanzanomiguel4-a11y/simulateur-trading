@@ -25,7 +25,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
-from simtrade import backtest, references, regimes, strategies
+from simtrade import backtest, fmt, references, regimes, strategies
 from simtrade.backtest import BacktestConfig, EvalCache, Market
 from simtrade.market import Candle
 from simtrade.models import PAIRS
@@ -502,6 +502,11 @@ def catalogue_json(b: Build) -> dict:
             "pnl_hors_echantillon": _d(c.oos["stats"].pnl) if c.oos else None,
             "trades_hors_echantillon": c.oos["stats"].trades if c.oos else None,
             "percentile_tirages": c.percentile,
+            "grille_echantillon": [
+                {"parametres": ov, "pnl": _d(c.cells[cell].pnl), "trades": c.cells[cell].trades,
+                 "candidate": c.cells[cell].candidate}
+                for cell, ov in combos(c.model) if cell in c.cells
+            ],
             "rapport": "backtests/" + c.report_name,
         })
     return {
@@ -534,11 +539,61 @@ def validate_catalogue(data: dict) -> None:
                 raise ValueError(f"Paramètre '{key}' hors de ses bornes dans l'entrée {e['modele']} {e['paire']}.")
 
 
-# --- Rapports Markdown ---
+# --- Rapports Markdown (nombres à la française) ---
+
+PHASES = {"echantillon": "échantillon", "hors_echantillon": "hors échantillon"}
+
+
+def _n(value: Decimal | float, decimals: int = 2, sign: bool = False) -> str:
+    return fmt.num(Decimal(str(value)), decimals, sign)
 
 
 def _money(value: Decimal | None) -> str:
-    return "–" if value is None else f"{value:+.2f}"
+    return "–" if value is None else _n(value, 2, sign=True)
+
+
+def _v(value: Any) -> str:
+    """Valeur de paramètre ou réglage : 0.4 → 0,4, sans zéros inutiles."""
+    text = format(Decimal(str(value)).normalize(), "f")
+    return text.replace(".", ",")
+
+
+def _duration(seconds: float) -> str:
+    if seconds < 60:
+        return f"{seconds:.0f} s".replace(".", ",")
+    return f"{_n(seconds / 60, 1)} min"
+
+
+def durations(b: Build) -> str:
+    """Durée de chaque phase ; une phase sans calcul est dite non lancée."""
+    tested = any(c.oos is not None for c in b.couples)
+    out = []
+    for key, label in PHASES.items():
+        if key == "hors_echantillon" and not tested:
+            out.append(f"{label} non lancé (aucune candidate)")
+        elif key in b.seconds:
+            out.append(f"{label} {_duration(b.seconds[key])}")
+    return ", ".join(out)
+
+
+def _settings(b: Build) -> str:
+    return (f"spread {_v(b.config.spread_pct)} %, frais {_v(b.config.fee_rate * 100)} % par ordre, "
+            f"capital {fmt.usdt(b.config.capital)}")
+
+
+def prudence(b: Build) -> str:
+    tested = [c for c in b.couples if c.oos is not None]
+    risk = 100 - BEAT_SHARE * 100
+    possible = len(GRID) * len(PAIRS)
+    if not tested:
+        return (f"**Prudence statistique** : aucun couple n'a été testé hors échantillon, donc aucun faux positif "
+                f"possible ici. Si les {possible} couples l'avaient été, au seuil de {_n(risk, 0)} % face aux tirages "
+                "au hasard, environ un aurait passé le critère par hasard, sans avantage réel.")
+    return (f"**Prudence statistique** : {len(tested)} couple(s) testé(s) hors échantillon contre les tirages au "
+            f"hasard, au seuil de {_n(risk, 0)} %. Même sans aucun avantage réel, environ "
+            f"{_n(len(tested) * (1 - BEAT_SHARE), 1)} couple(s) passeraient ce critère par hasard ({possible} tests "
+            f"à ce seuil : environ un faux positif). Le critère reste à {_n(BEAT_SHARE * 100, 0)} % ; le percentile "
+            "exact de chaque couple est donné ci-dessus et dans son rapport.")
 
 
 def report_md(c: Couple, b: Build) -> str:
@@ -546,12 +601,11 @@ def report_md(c: Couple, b: Build) -> str:
     lines = [f"# {c.model} sur {c.pair} ({INTERVAL})", "",
              f"Statut : **{c.status}**" + (f" ({' ; '.join(c.reasons)})" if c.reasons else ""), "",
              f"Échantillon : {b.periods.is_start:%d/%m/%Y} → {b.periods.cut:%d/%m/%Y} ; hors échantillon : "
-             f"{b.periods.cut:%d/%m/%Y} → {b.periods.end:%d/%m/%Y} (fin exclue). Spread {b.config.spread_pct} %, "
-             f"frais {b.config.fee_rate * 100} % par ordre, capital {b.config.capital} USDT.", "",
+             f"{b.periods.cut:%d/%m/%Y} → {b.periods.end:%d/%m/%Y} (fin exclue). {_settings(b)[0].upper() + _settings(b)[1:]}.", "",
              "## Grille en échantillon", "",
              f"P&L en USDT (trades) ; lignes : `{k1}`, colonnes : `{k2}`. * : candidate (≥ {MIN_TRADES} trades et P&L > 0) ; "
              "[ ] : combinaison choisie.", "",
-             "| | " + " | ".join(str(v) for v in v2) + " |", "|---|" + "---|" * len(v2)]
+             "| | " + " | ".join(_v(v) for v in v2) + " |", "|---|" + "---|" * len(v2)]
     score = scores(c.cells, (3, 3)) if len(c.cells) == 9 else {}
     for i, a in enumerate(v1):
         row = []
@@ -559,42 +613,43 @@ def report_md(c: Couple, b: Build) -> str:
             cell = c.cells.get((i, j))
             text = "–" if cell is None else f"{_money(cell.pnl)} ({cell.trades}){'*' if cell.candidate else ''}"
             row.append(f"[{text}]" if c.choice == (i, j) else text)
-        lines.append(f"| **{a}** | " + " | ".join(row) + " |")
+        lines.append(f"| **{_v(a)}** | " + " | ".join(row) + " |")
     if score:
         lines += ["", "Score de voisinage (moyenne du P&L de la combinaison et de ses voisines directes) :", "",
-                  "| | " + " | ".join(str(v) for v in v2) + " |", "|---|" + "---|" * len(v2)]
+                  "| | " + " | ".join(_v(v) for v in v2) + " |", "|---|" + "---|" * len(v2)]
         for i, a in enumerate(v1):
-            lines.append(f"| **{a}** | " + " | ".join(_money(score[(i, j)]) for j in range(len(v2))) + " |")
+            lines.append(f"| **{_v(a)}** | " + " | ".join(_money(score[(i, j)]) for j in range(len(v2))) + " |")
     if c.choice is None:
         lines += ["", "Aucune candidate : hors échantillon non lancé."]
         return "\n".join(lines) + "\n"
     found = bounds(c.model, c.rect)  # type: ignore[arg-type]
-    lines += ["", f"Paramètres choisis : {', '.join(f'`{k}` = {v}' for k, v in c.overrides.items())}.",  # type: ignore[union-attr]
+    lines += ["", f"Paramètres choisis : {', '.join(f'`{k}` = {_v(v)}' for k, v in c.overrides.items())}.",  # type: ignore[union-attr]
               "Bornes (plus grand rectangle de candidates) : "
-              + ", ".join(f"`{k}` de {v['min']} à {v['max']}" for k, v in found.items()) + "."]
+              + ", ".join(f"`{k}` de {_v(v['min'])} à {_v(v['max'])}" for k, v in found.items()) + "."]
     o = c.oos
     if o is None:
         return "\n".join(lines) + "\n"
     s, sens = o["stats"], o["sensitivity"]
     lines += ["", "## Hors échantillon (lancé une fois)", "",
               "| | P&L | P&L % | Trades | Réussite | Drawdown max | Sharpe | Frais |", "|---|---|---|---|---|---|---|---|"]
-    for label, st in ((f"Stratégie (s = {b.config.spread_pct} %)", s), (f"Stratégie (s = {SENSITIVITY_SPREAD} %)", sens),
+    for label, st in ((f"Stratégie (s = {_v(b.config.spread_pct)} %)", s),
+                      (f"Stratégie (s = {_v(SENSITIVITY_SPREAD)} %)", sens),
                       ("Achat 00:00 / vente clôture", o["open_close"]), ("Ne rien faire", o["nothing"])):
-        lines.append(f"| {label} | {_money(st.pnl)} | {st.pnl_pct:+.3f} | {st.trades} | "
-                     f"{'–' if st.win_rate is None else f'{st.win_rate:.1f} %'} | {st.max_drawdown_pct:.3f} % | "
-                     f"{'–' if st.sharpe is None else f'{st.sharpe:.2f}'} | {st.fees:.2f} |")
+        lines.append(f"| {label} | {_money(st.pnl)} | {_n(st.pnl_pct, 3, sign=True)} % | {st.trades} | "
+                     f"{'–' if st.win_rate is None else f'{_n(st.win_rate, 1)} %'} | {_n(st.max_drawdown_pct, 3)} % | "
+                     f"{'–' if st.sharpe is None else _n(st.sharpe, 2)} | {_n(st.fees, 2)} |")
     beaten = sum(1 for d in c.draws if d < s.pnl)
     lines += ["", f"Tirages au hasard : {len(c.draws)} (graines {b.seeds[0]} à {b.seeds[-1]}), probabilité d'entrée "
-              f"p = {o['entries']} / {o['eligible']} = {o['p']:.5f} par clôture éligible. Stratégie meilleure que "
-              f"{beaten} tirages sur {len(c.draws)} : **percentile {c.percentile:.0f}** (critère : ≥ {BEAT_SHARE:.0%}). "
-              f"P&L des tirages : min {_money(min(c.draws))}, médiane {_money(statistics.median(c.draws))}, "
-              f"max {_money(max(c.draws))}."]
+              f"p = {o['entries']} / {o['eligible']} = {_n(o['p'], 5)} par clôture éligible. Stratégie meilleure que "
+              f"{beaten} tirages sur {len(c.draws)} : **percentile {_n(c.percentile, 0)}** "
+              f"(critère : ≥ {_n(BEAT_SHARE * 100, 0)} %). P&L des tirages : min {_money(min(c.draws))}, "
+              f"médiane {_money(statistics.median(c.draws))}, max {_money(max(c.draws))}."]
     if s.trades >= MIN_TRADES and c.status == ADMITTED and sens.pnl <= 0:
-        lines.append(f"\n**Fragile au spread** : P&L ≤ 0 à s = {SENSITIVITY_SPREAD} % (`fragile_spread`).")
+        lines.append(f"\n**Fragile au spread** : P&L ≤ 0 à s = {_v(SENSITIVITY_SPREAD)} % (`fragile_spread`).")
     th = o["thresholds"]
     lines += ["", "## Régimes", "",
-              f"Seuils fixés en échantillon : ATR 14 ≥ {th.atr_pct:.4f} % → forte volatilité ; sinon efficacité (24 bougies) "
-              f"≥ {th.efficiency:.4f} → tendance ; sinon range.", "",
+              f"Seuils fixés en échantillon : ATR 14 ≥ {_n(th.atr_pct, 4)} % → forte volatilité ; sinon efficacité "
+              f"(24 bougies) ≥ {_n(th.efficiency, 4)} → tendance ; sinon range.", "",
               "| Régime | Trades (éch.) | P&L / trade (éch.) | Trades (hors éch.) | P&L / trade (hors éch.) |",
               "|---|---|---|---|---|"]
     for r in regimes.REGIMES + ("inconnu",):
@@ -613,27 +668,20 @@ def report_md(c: Couple, b: Build) -> str:
 
 
 def summary_md(b: Build) -> str:
-    tested = [c for c in b.couples if c.oos is not None]
     lines = ["# Catalogue : synthèse", "",
-             f"Construit le {b.created_at:%d/%m/%Y %H:%M} UTC (commit {b.commit or 'inconnu'}) en "
-             + ", ".join(f"{k} {v / 60:.1f} min" for k, v in b.seconds.items()) + ".", "",
+             f"Calcul terminé le {b.created_at:%d/%m/%Y à %H:%M} UTC (commit {b.commit or 'inconnu'}) : {durations(b)}.", "",
              f"Échantillon {b.periods.is_start:%d/%m/%Y} → {b.periods.cut:%d/%m/%Y}, hors échantillon "
-             f"{b.periods.cut:%d/%m/%Y} → {b.periods.end:%d/%m/%Y}, intervalle {INTERVAL}, spread {b.config.spread_pct} %, "
-             f"frais {b.config.fee_rate * 100} %. Critères figés avant le calcul (README, « Backtest et catalogue »).", "",
+             f"{b.periods.cut:%d/%m/%Y} → {b.periods.end:%d/%m/%Y}, intervalle {INTERVAL}, {_settings(b)}. "
+             "Critères figés avant le calcul (README, « Backtest et catalogue »).", "",
              "| Modèle | Paire | Statut | P&L hors éch. | Trades | Percentile tirages | Achat-clôture |",
              "|---|---|---|---|---|---|---|"]
     for c in b.couples:
         o = c.oos
         lines.append(f"| {c.model} | {c.pair} | {c.status} | {_money(o['stats'].pnl) if o else '–'} | "
-                     f"{o['stats'].trades if o else '–'} | {'–' if c.percentile is None else f'{c.percentile:.0f}'} | "
+                     f"{o['stats'].trades if o else '–'} | {'–' if c.percentile is None else _n(c.percentile, 0)} | "
                      f"{_money(o['open_close'].pnl) if o else '–'} |")
     lines += ["", f"Stratégies admises : {len(b.admitted)}." + (" Le catalogue est vide : c'est un résultat valide."
-                                                               if not b.admitted else ""), "",
-              f"**Prudence statistique** : {len(tested)} couple(s) testé(s) hors échantillon contre les tirages au hasard, "
-              f"au seuil de {100 - BEAT_SHARE * 100:.0f} %. Même sans aucun avantage réel, environ "
-              f"{len(tested) * (1 - BEAT_SHARE):.1f} couple(s) passeraient ce critère par hasard "
-              f"({len(GRID) * len(PAIRS)} tests au seuil de 10 % : environ un faux positif). Le critère reste à 90 % ; "
-              "le percentile exact de chaque couple est donné ci-dessus et dans son rapport."]
+                                                               if not b.admitted else ""), "", prudence(b)]
     return "\n".join(lines) + "\n"
 
 

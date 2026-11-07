@@ -912,7 +912,7 @@ def _build_catalogue(service: TradingService, args: argparse.Namespace) -> int:
                         progress=lambda m: print("  " + m, flush=True))
     data = catalogue.write(b, cat_path, reports)
     print(f"Terminé : {len(data['entrees'])} stratégie(s) admise(s) sur {len(data['resultats'])} ; "
-          + ", ".join(f"{k} {v / 60:.1f} min" for k, v in b.seconds.items()))
+          + catalogue.durations(b))
     return 0
 
 
