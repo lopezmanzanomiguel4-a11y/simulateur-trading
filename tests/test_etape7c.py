@@ -303,3 +303,10 @@ def test_limites_swing_modifiables_seulement_en_swing(env):
     assert env.storage.risk_limits(env.service.account("swing").id) == limits
     with pytest.raises(InvalidInput, match="réservée aux comptes swing"):
         env.service.set_risk_limits({"semaine": "3"}, compte="robot")
+
+
+def test_strategie_swing_hors_paires_live_refusee_a_l_activation(env):
+    definition = {**SWING_DEF, "paire": "BNBUSDT"}
+    assert strategies.validate(definition).paire == "BNBUSDT"  # admise au backtest
+    with pytest.raises(InvalidInput, match="pas suivie en direct"):
+        env.service.activate_strategy(compte="swing", definition=definition)

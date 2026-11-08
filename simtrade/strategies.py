@@ -27,7 +27,7 @@ from simtrade.bricks import BrickResult, MarketView
 from simtrade.engine import FEE_RATE, normalize_pair, parse_decimal
 from simtrade.errors import InvalidInput
 from simtrade.market import Quality
-from simtrade.models import HORIZONS, INTRADAY, PAIRS, SWING
+from simtrade.models import HORIZONS, INTRADAY, PAIRS, SWING, SWING_PAIRS
 from simtrade.sessions import SessionRules, entry_allowed, parse_hhmm
 
 MODELS_DIR = Path(__file__).parent / "modeles"
@@ -159,7 +159,10 @@ SWING_TARGETS: dict[str, dict[str, Param]] = {
     "aucun": {},  # sortie par le stop (suiveur) ou les briques de sortie seulement
 }
 RISK_SIZE: dict[str, Param] = {"risque_pct": _dec("0.25", "2", "1")}  # taille au risque, en % de la valeur du compte
-SWING_TOP: dict[str, Param] = {"intervalle": Param("choix", "1d", choices=SWING_INTERVALS)}
+SWING_TOP: dict[str, Param] = {
+    "paire": _choice(*SWING_PAIRS),  # backtest : univers swing ; le live se limite à PAIRS (activate_strategy)
+    "intervalle": Param("choix", "1d", choices=SWING_INTERVALS),
+}
 KEYS = ("nom", "paire", "intervalle", "entree", "sortie", "stop", "objectif", "taille", "heures_actives", "horizon")
 
 
@@ -356,12 +359,12 @@ def validate(raw: Any) -> Strategy:
         pair = normalize_pair(pair_raw) if isinstance(pair_raw, str) else pair_raw
     except InvalidInput:
         pair = pair_raw
-    pair = _value(TOP["paire"], pair, "paire")
     horizon = raw.get("horizon", INTRADAY)
     if horizon not in HORIZONS:
         raise _err("horizon", f"invalide : {horizon!r} (choix : {', '.join(HORIZONS)}).")
     swing = horizon == SWING
     top = SWING_TOP if swing else TOP
+    pair = _value(top["paire"], pair, "paire")
     interval = _value(top["intervalle"], raw.get("intervalle", top["intervalle"].default), "intervalle")
     if "entree" not in raw:
         raise _err("entree", "manquante (au moins une brique).")

@@ -274,3 +274,11 @@ def test_fenetre_live_swing_marche_db_plus_hub():
     got = asyncio.run(runner.swing_candles(s, H0 + 51 * H + timedelta(seconds=5)))
     assert [c.open_time for c in got] == [H0, H0 + 24 * H]  # jour en cours (pas clos) exclu
     assert got[-1].high == D(120) and got[-1].close == D(118) and got[-1].complete
+
+
+def test_modele_d_essai_valide_sur_les_10_paires_swing_seulement():
+    for pair in SWING_PAIRS:
+        s = strategies.validate(strategies.with_overrides(strategies.model("essai-donchian"), {"paire": pair}))
+        assert s.paire == pair
+    with pytest.raises(InvalidInput, match="paire"):
+        strategies.validate(strategies.with_overrides(strategies.model("tendance-ema"), {"paire": "BNBUSDT"}))

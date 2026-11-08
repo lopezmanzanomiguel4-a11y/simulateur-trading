@@ -887,6 +887,11 @@ class TradingService:
                     f"La stratégie {strategy.nom} est {strategy.horizon} et le compte '{account.name}' est "
                     f"{account.horizon} : une stratégie ne s'active que sur un compte du même horizon."
                 )
+            if strategy.paire not in PAIRS:
+                raise InvalidInput(
+                    f"La paire {strategy.paire} n'est pas suivie en direct (choix : {', '.join(PAIRS)}) : "
+                    "elle ne sert qu'au backtest swing."
+                )
             record = self.storage.activate_strategy(account.id, strategy.nom, strategy.dumps(), self.clock())
         log.info("Stratégie %s activée sur le compte %s.", strategy.nom, account.name)
         return account, record, strategy
